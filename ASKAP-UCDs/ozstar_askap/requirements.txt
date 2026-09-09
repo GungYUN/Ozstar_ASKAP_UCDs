@@ -1,5 +1,0 @@
-numpy
-pandas
-astropy
-h5py
-astroquery
