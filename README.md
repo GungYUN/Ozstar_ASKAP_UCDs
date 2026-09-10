@@ -54,6 +54,16 @@ does not put the password in the SCP command:
 ./deploy_to_ozstar.sh
 ```
 
+Alternatively, provide the Ozstar password only for one deployment without
+creating a local password file:
+
+```bash
+read -r -s TRANSFER_PASSWORD
+export TRANSFER_PASSWORD
+./deploy_to_ozstar.sh
+unset TRANSFER_PASSWORD
+```
+
 The DStools container must exist at:
 
 ```text
@@ -66,19 +76,35 @@ container.  Create a venv on Fred with:
 
 ```bash
 ./setup_host_python.sh
+module load gcc/13.3.0
 module load python/3.12.3
+export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+export ASKAP_SBATCH_MEM=80G
 ```
 
 The script only executes `module load`; it does not run `module purge`,
 `module unload` or remove any existing environment.  If the current shell
 already has the `mamba` module loaded and the Python module reports a conflict,
 start a new login shell and run the script there without loading `mamba`.
-Always use the absolute venv interpreter, or set `ASKAP_PYTHON_BIN` to another
-prepared interpreter, before running `ozstar_main.py`.  The generated Slurm
-script loads the configured Python module and checks the imports before starting
-a job.
+
+Run the following block once at the start of every new login shell before
+planning or submitting a job.  It is not necessary to recreate the venv each
+time:
+
+```bash
+module load gcc/13.3.0
+module load python/3.12.3
+export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
+export ASKAP_PYTHON_MODULE=python/3.12.3
+export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+export ASKAP_SBATCH_MEM=80G
+```
+
+The generated Slurm script loads `apptainer`, the configured parent GCC module
+and Python module, checks the imports, uses the venv interpreter, requests 32
+CPUs and 80G memory, and assigns a short job name such as `U1501-50`.
 
 ## Credentials
 
@@ -123,9 +149,12 @@ Run on the Ozstar login node.  First use a dry plan:
 
 ```bash
 cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
+module load gcc/13.3.0
 module load python/3.12.3
+export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+export ASKAP_SBATCH_MEM=80G
 $ASKAP_PYTHON_BIN ozstar_main.py --begin 1 --end 50 --no-submit
 ```
 
@@ -141,8 +170,12 @@ previous `complete`, `queued` or `running` state should deliberately be
 replanned.
 
 The default packer uses 4 slots × 8 CPU, estimates 4 hours per observation,
-targets 40 observations and requests 48 hours.  These values are all in
+targets 40 observations and requests 48 hours with 80G memory.  These values are all in
 `config.py` and can be overridden with environment variables.
+
+The generated Slurm job name is shortened to the form `U<start>-<count>`, for
+example `U1501-50`.  Manifest and sbatch filenames retain a timestamp so that
+repeated submissions do not overwrite one another.
 
 Each source is downloaded in waves of at most four observations.  A wave is
 processed before the next wave is downloaded.  Therefore a source with many
@@ -304,9 +337,12 @@ cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
 然后在当前 shell 中加载与 venv 创建时相同的 Python module：
 
 ```bash
+module load gcc/13.3.0
 module load python/3.12.3
+export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+export ASKAP_SBATCH_MEM=80G
 ```
 
 验证环境：
@@ -373,6 +409,7 @@ sptnumabs_formula >= 20
 
 ```bash
 cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
+module load gcc/13.3.0
 module load python/3.12.3
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
@@ -405,7 +442,10 @@ ls -lt /fred/oz299/qhuang/ASKAP-UCDs/state/jobs/
 ```
 
 默认配置为 4 个并行槽、每槽 8 CPU、每次目标约 40 次观测、48 小时墙钟，具体
-参数位于 `config.py`，也可以通过环境变量覆盖。
+并请求 80G 内存。具体参数位于 `config.py`，也可以通过环境变量覆盖。
+
+生成的 Slurm 作业名采用 `U<起始序号>-<总数>` 格式，例如
+`U1501-50`。manifest 和 sbatch 文件名仍保留时间戳，重复提交不会互相覆盖。
 
 ## 中文 6：提交 Slurm 任务
 
@@ -421,9 +461,12 @@ $ASKAP_PYTHON_BIN ozstar_main.py \
 生成的 Slurm 作业会自动：
 
 - 加载 `apptainer`；
+- 加载 `gcc/13.3.0` 作为 Python module 的父 module；
 - 加载 `ASKAP_PYTHON_MODULE` 指定的 Python module；
 - 使用 `ASKAP_PYTHON_BIN` 指定的 venv Python；
 - 检查 numpy、pandas、astropy、h5py 和 astroquery；
+- 请求 32 个 CPU 和 80G 内存；
+- 使用 `U<起始序号>-<总数>` 格式的短作业名，例如 `U1501-50`；
 - 在计算节点运行 `process_job.py`。
 
 查看任务：

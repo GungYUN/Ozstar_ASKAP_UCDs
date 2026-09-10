@@ -86,10 +86,13 @@ CASDA_QUERY_LIMIT = int(os.environ.get("ASKAP_CASDA_QUERY_LIMIT", "5000"))
 
 # Slurm settings.  --tmp is only a small scratch allocation; the persistent
 # ASKAP-UCDs tree stores all MS, WSClean products, checkpoints and logs.
-SBATCH_MEM = os.environ.get("ASKAP_SBATCH_MEM", "200G")
+SBATCH_MEM = os.environ.get("ASKAP_SBATCH_MEM", "80G")
 SBATCH_TMP = os.environ.get("ASKAP_SBATCH_TMP", "10G")
 SBATCH_PARTITION = os.environ.get("ASKAP_SBATCH_PARTITION", "")
 PYTHON_BIN = os.environ.get("ASKAP_PYTHON_BIN", "python3")
+PYTHON_PARENT_MODULE = os.environ.get(
+    "ASKAP_PYTHON_PARENT_MODULE", "gcc/13.3.0"
+)
 PYTHON_MODULE = os.environ.get("ASKAP_PYTHON_MODULE", "python/3.12.3")
 
 # CASDA credentials are read only at runtime.  Prefer a protected file over an

@@ -6,8 +6,10 @@ set -Eeuo pipefail
 # DStools/casacore/WSClean remain inside the Apptainer image.
 ROOT="${ASKAP_WORK:-/fred/oz299/qhuang/ASKAP-UCDs}"
 ENV_PREFIX="${ASKAP_PYTHON_ENV:-${ROOT}/.venv/askap-python}"
+PYTHON_PARENT_MODULE="${ASKAP_PYTHON_PARENT_MODULE:-gcc/13.3.0}"
 PYTHON_MODULE="${ASKAP_PYTHON_MODULE:-python/3.12.3}"
 
+module load "${PYTHON_PARENT_MODULE}"
 module load "${PYTHON_MODULE}"
 
 if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
@@ -23,6 +25,7 @@ fi
 "${ENV_PREFIX}/bin/python" -c \
   'import astropy, astroquery, h5py, numpy, pandas; print("ASKAP host Python environment is ready")'
 printf 'Use this interpreter before planning jobs:\n'
+printf 'module load %s\n' "${PYTHON_PARENT_MODULE}"
 printf 'module load %s\n' "${PYTHON_MODULE}"
 printf 'export ASKAP_PYTHON_MODULE=%s\n' "${PYTHON_MODULE}"
 printf 'export ASKAP_PYTHON_BIN=%s\n' "${ENV_PREFIX}/bin/python"

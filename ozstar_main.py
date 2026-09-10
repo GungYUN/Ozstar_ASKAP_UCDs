@@ -147,12 +147,24 @@ def _time_string(hours: float) -> str:
 
 
 def _job_name(start: int, end: int) -> str:
+    """Return the short Slurm name, e.g. U1501-50."""
+
+    name = f"U{start}-{end - start + 1}"
+    if len(name) > 8:
+        raise ValueError(
+            f"Slurm job name {name!r} exceeds 8 characters; "
+            "use a shorter starting UCS range."
+        )
+    return name
+
+
+def _job_tag(start: int, end: int) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"askap-{start}-{end}-{stamp}"
+    return f"{_job_name(start, end)}-{stamp}"
 
 
-def _write_sbatch(manifest_path: Path, job_name: str) -> Path:
-    script_path = config.STATE_ROOT / "jobs" / f"{job_name}.sbatch"
+def _write_sbatch(manifest_path: Path, job_tag: str, job_name: str) -> Path:
+    script_path = config.STATE_ROOT / "jobs" / f"{job_tag}.sbatch"
     time_limit = _time_string(config.JOB_WALLTIME_HOURS)
     lines = [
         "#!/usr/bin/env bash",
@@ -172,6 +184,7 @@ def _write_sbatch(manifest_path: Path, job_name: str) -> Path:
             "",
             "set -Eeuo pipefail",
             "module load apptainer",
+            f"module load {shlex.quote(config.PYTHON_PARENT_MODULE)}",
             f"module load {shlex.quote(config.PYTHON_MODULE)}",
             f"command -v {shlex.quote(config.PYTHON_BIN)} >/dev/null",
             f"{shlex.quote(config.PYTHON_BIN)} -c "
@@ -325,10 +338,11 @@ def main() -> None:
         return
 
     job_name = _job_name(args.begin, args.end)
-    manifest_path = config.STATE_ROOT / "jobs" / f"{job_name}.json"
+    job_tag = _job_tag(args.begin, args.end)
+    manifest_path = config.STATE_ROOT / "jobs" / f"{job_tag}.json"
     manifest["manifest_path"] = str(manifest_path)
     atomic_write_json(manifest_path, manifest)
-    script_path = _write_sbatch(manifest_path, job_name)
+    script_path = _write_sbatch(manifest_path, job_tag, job_name)
 
     print(json_summary(manifest))
     print(f"Manifest: {manifest_path}")
