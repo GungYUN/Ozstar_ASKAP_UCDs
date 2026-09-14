@@ -25,10 +25,24 @@ from astropy.table import Table
 
 try:
     from . import config
-    from .pipeline_utils import obs_number, safe_source_name
+    from .pipeline_utils import (
+        atomic_write_json,
+        download_state_path,
+        obs_number,
+        read_json,
+        safe_source_name,
+        utc_now,
+    )
 except ImportError:  # Deployed-directory script mode / 部署目录直接脚本模式。
     import config
-    from pipeline_utils import obs_number, safe_source_name
+    from pipeline_utils import (
+        atomic_write_json,
+        download_state_path,
+        obs_number,
+        read_json,
+        safe_source_name,
+        utc_now,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +133,76 @@ def _redact_url(url: str) -> str:
 
     parsed = urlparse(url)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _download_sb_key(url: str) -> str:
+    """Extract an SB key from a CASDA data/checksum URL.
+
+    中文：从 CASDA data/checksum URL 中提取 SB 编号，作为下载状态键。
+    """
+
+    filename = _url_basename(url)
+    match = re.search(r"SB(\d+)", filename, flags=re.IGNORECASE)
+    return f"SB{match.group(1)}" if match else f"UNKNOWN:{filename}"
+
+
+def _record_download_event(
+    source_name: str,
+    url: str,
+    status: str,
+    attempt: int,
+    error: str | None = None,
+) -> None:
+    """Record the latest and historical status for one source+SB download.
+
+    English: Signed URL query strings are redacted before they are stored.
+
+    中文：保存源+SB 的最新状态和历史重试记录；写入前会去除签名 URL 的查询参数。
+    """
+
+    path = download_state_path(source_name)
+    state = read_json(path, {}) or {}
+    sb_key = _download_sb_key(url)
+    entry = state.setdefault("sbs", {}).setdefault(sb_key, {})
+    history = entry.setdefault("history", [])
+    event = {
+        "attempt": attempt,
+        "status": status,
+        "url": _redact_url(url),
+        "time": utc_now(),
+    }
+    if error:
+        event["error"] = error
+    history.append(event)
+    entry.update(
+        {
+            "source_name": safe_source_name(source_name),
+            "sb": sb_key,
+            "status": status,
+            "attempts": max(int(entry.get("attempts", 0)), attempt),
+            "last_url": _redact_url(url),
+            "updated_at": event["time"],
+        }
+    )
+    if error:
+        entry["last_error"] = error
+    state["source_name"] = safe_source_name(source_name)
+    state["updated_at"] = event["time"]
+    atomic_write_json(path, state)
+
+
+def failed_download_sbs(source_name: str) -> list[str]:
+    """Return source+SB keys whose latest status is download_failed.
+
+    中文：返回最新状态为 `download_failed` 的源+SB 键列表。
+    """
+
+    state = read_json(download_state_path(source_name), {}) or {}
+    return sorted(
+        key
+        for key, entry in state.get("sbs", {}).items()
+        if entry.get("status") == "download_failed"
+    )
 
 
 def _filter_and_deduplicate(rows: Table, ra_deg: float, dec_deg: float) -> Table:
@@ -367,6 +451,7 @@ def download_urls_safely(
     urls: list[str],
     savedir: Path,
     source_name: str,
+    attempt: int = 1,
 ) -> tuple[list[str], list[tuple[str, str]]]:
     """Download only CASDA archives and their checksums, one at a time.
 
@@ -395,10 +480,18 @@ def download_urls_safely(
                     raise RuntimeError("CASDA returned no local data file")
                 successful.append(data_url)
                 data_ok = True
+                _record_download_event(source_name, data_url, "downloaded", attempt)
                 logger.info("Downloaded %s for %s", base_name, source_name)
             except Exception as exc:  # One file must not abort a source / 单个文件失败不能中止整个源。
                 message = str(exc)
                 failed.append((data_url, message))
+                _record_download_event(
+                    source_name,
+                    data_url,
+                    "download_failed",
+                    attempt,
+                    message,
+                )
                 failure_log.parent.mkdir(parents=True, exist_ok=True)
                 with failure_log.open("a", encoding="utf-8") as handle:
                     handle.write(f"{source_name} | {_redact_url(data_url)} | {message}\n")
@@ -411,8 +504,16 @@ def download_urls_safely(
             try:
                 client.download_files([checksum_url], savedir=str(savedir))
                 successful.append(checksum_url)
+                _record_download_event(source_name, checksum_url, "checksum_downloaded", attempt)
             except Exception as exc:
                 failed.append((checksum_url, str(exc)))
+                _record_download_event(
+                    source_name,
+                    checksum_url,
+                    "checksum_failed",
+                    attempt,
+                    str(exc),
+                )
                 logger.warning(
                     "Checksum download failed for %s: %s",
                     _redact_url(checksum_url),
@@ -427,6 +528,7 @@ def download_source_table(
     rows: Table,
     longobs: Path,
     source_name: str,
+    attempt: int = 1,
 ) -> tuple[int, int]:
     """Stage and download all not-yet-present observations for one source.
 
@@ -444,7 +546,13 @@ def download_source_table(
         batch = pending[start : start + config.CASDA_STAGE_BATCH_SIZE]
         try:
             urls = client.stage_data(batch)
-            success, failed = download_urls_safely(client, list(urls), longobs, source_name)
+            success, failed = download_urls_safely(
+                client,
+                list(urls),
+                longobs,
+                source_name,
+                attempt=attempt,
+            )
             success_count += len(success)
             failure_count += len(failed)
         except Exception as exc:

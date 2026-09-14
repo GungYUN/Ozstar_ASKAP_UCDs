@@ -120,6 +120,18 @@ def source_state_path(source_name: str) -> Path:
     return STATE_ROOT / "sources" / f"{safe_source_name(source_name)}.json"
 
 
+def download_state_path(source_name: str) -> Path:
+    """Return the per-source, per-SB download-state JSON path.
+
+    English: This is separate from the source controller state so one source
+    can retain individual SB download history and retry outcomes.
+
+    中文：该文件独立于源级 controller 状态，用于保留每个 SB 的下载历史和重试结果。
+    """
+
+    return STATE_ROOT / "sources" / f"{safe_source_name(source_name)}.downloads.json"
+
+
 def write_source_state(source_name: str, **values: Any) -> None:
     """Merge values into one source state and write it atomically.
 

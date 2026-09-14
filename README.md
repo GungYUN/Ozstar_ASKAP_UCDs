@@ -365,6 +365,11 @@ failures. A block is not complete merely because a Slurm job exited: every
 source must be terminal, and every complete source must pass product and
 staging-residue validation.
 
+Per-SB download outcomes are stored separately in
+`state/sources/UCSXXXX.downloads.json`. Each entry identifies the source and
+SB key, latest status (`downloaded`, `download_failed`, or checksum status),
+attempt count, redacted URL, and retry history.
+
 The ada-compatible product tree is:
 
 ```text
@@ -405,6 +410,10 @@ its deletion safeguard requires a separate deliberate option.
 `state/sources/` 中的源状态文件，并查看 `logs/` 和生成的 Slurm 输出是否有失败。
 不能仅凭 Slurm job 退出就认为 block 完成：每个源都必须处于终态，而且 `complete`
 源必须通过产物和 staging 残留检查。
+
+每个源的 SB 下载结果单独保存在
+`state/sources/UCSXXXX.downloads.json`。每条记录包含源名和 SB 键、最新状态
+（`downloaded`、`download_failed` 或 checksum 状态）、尝试次数、去敏后的 URL 和重试历史。
 
 ada-compatible 产物目录如下：
 
@@ -591,3 +600,30 @@ python casda_remote_compare.py --obs-id 50508 --limit 1
 
 只有在确实需要整批旧流程测试时才使用 `--limit 40`。不要公开完整 staged URL，
 因为其中包含临时访问签名。
+
+For a one-row comparison using the deployed production venv, production
+keyring adapter, current `UCS1501.ecsv`, `build_casda_client()`, `stage_data()`,
+and single-data-URL `download_files()`, run on Ozstar:
+
+```bash
+$ASKAP_PYTHON_BIN casda_production_compare.py \
+  --source UCS1501 \
+  --obs-id 63406
+```
+
+The diagnostic writes only below `WORK/diagnostics/`, not to production
+`staging/` or `products/`. Do not publish complete signed URLs printed by
+lower-level Astroquery progress output.
+
+如果需要使用部署后的生产 venv、生产 keyring 适配器、当前
+`UCS1501.ecsv`、`build_casda_client()`、`stage_data()` 和单个 data URL 的
+`download_files()` 做一对一对照，可以在 Ozstar 运行：
+
+```bash
+$ASKAP_PYTHON_BIN casda_production_compare.py \
+  --source UCS1501 \
+  --obs-id 63406
+```
+
+诊断文件只写入 `WORK/diagnostics/`，不会写入生产 `staging/` 或 `products/`。
+不要公开底层 Astroquery 输出中的完整预签名 URL。

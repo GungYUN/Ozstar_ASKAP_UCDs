@@ -29,6 +29,7 @@ try:
         build_casda_client,
         download_source_table,
         estimated_access_bytes,
+        failed_download_sbs,
     )
     from .pipeline_utils import (
         atomic_write_json,
@@ -44,7 +45,12 @@ try:
     )
 except ImportError:  # Deployed-directory script mode / 部署目录直接脚本模式。
     import config
-    from casda_query import build_casda_client, download_source_table, estimated_access_bytes
+    from casda_query import (
+        build_casda_client,
+        download_source_table,
+        estimated_access_bytes,
+        failed_download_sbs,
+    )
     from pipeline_utils import (
         atomic_write_json,
         completed_product_sb_numbers,
@@ -160,7 +166,9 @@ def _read_rows(source: dict[str, Any], expected: set[int]) -> Table:
 
 
 def _prepare_source_once(
-    source: dict[str, Any], manifest_path: Path | None = None
+    source: dict[str, Any],
+    manifest_path: Path | None = None,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     """Download all required visibility archives for one manifest source.
 
@@ -217,6 +225,7 @@ def _prepare_source_once(
                 rows[pending_mask],
                 staging_longobs,
                 source_name,
+                attempt=attempt,
             )
             logger.info(
                 "%s: login-node CASDA preparation downloaded %d URLs (%d failed)",
@@ -287,14 +296,16 @@ def prepare_source(
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            return _prepare_source_once(source, manifest_path)
+            return _prepare_source_once(source, manifest_path, attempt=attempt)
         except Exception as exc:
             last_error = exc
             _download_retry_message(source_name, attempt, exc)
             if attempt < retries and config.CASDA_SOURCE_RETRY_DELAY_SECONDS > 0:
                 time.sleep(config.CASDA_SOURCE_RETRY_DELAY_SECONDS)
+    failed_sbs = failed_download_sbs(source_name)
     raise SourceDownloadFailed(
-        f"{source_name}: download failed after {retries} attempts: {last_error}"
+        f"{source_name}: download failed after {retries} attempts; "
+        f"failed SBs={','.join(failed_sbs) or 'unknown'}: {last_error}"
     ) from last_error
 
 
@@ -352,7 +363,13 @@ def prepare_manifest(manifest_path: Path, allow_multiple: bool = False) -> dict[
             result = prepare_source(source, manifest_path)
         except SourceDownloadFailed as exc:
             failed_source_names.add(source_name)
-            write_source_state(source_name, status="download_failed", error=str(exc))
+            failed_sbs = failed_download_sbs(source_name)
+            write_source_state(
+                source_name,
+                status="download_failed",
+                error=str(exc),
+                download_failed_sbs=failed_sbs,
+            )
             logger.error("%s: skipping after download retries: %s", source_name, exc)
             continue
         except Exception as exc:
@@ -375,6 +392,9 @@ def prepare_manifest(manifest_path: Path, allow_multiple: bool = False) -> dict[
         if record.get("source_name") in failed_source_names:
             record["status"] = "download_failed"
             record["reason"] = "download retries exhausted"
+            record["download_failed_sbs"] = failed_download_sbs(
+                record["source_name"]
+            )
     manifest["download_failed_sources"] = sorted(failed_source_names)
     manifest["download_prepared_at"] = utc_now()
     manifest["download_prepared_on"] = "login"
