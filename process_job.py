@@ -1,8 +1,16 @@
-"""Run one manifest on an Ozstar compute node.
+"""Run one prepared manifest on an Ozstar compute node.
 
-The job keeps all persistent data below ``/fred/oz299/qhuang/ASKAP-UCDs``.
-Each source is handled serially, while up to four SB folders are processed in
-parallel.  Each DStools process receives eight CPU threads.
+English: Persistent data remains below `ASKAP_WORK`. Sources are handled
+serially while up to four SB folders run in parallel, with eight CPU threads
+per DStools process by default. CASDA downloads are disabled by default because
+compute nodes cannot resolve `data.csiro.au`; login preparation leaves tar
+files for this worker to extract. A walltime partial result is checkpointed so
+the generated sbatch wrapper can resubmit itself.
+
+中文：持久化数据全部位于 `ASKAP_WORK` 下。源按顺序处理，每次最多并行四个 SB 目录，
+默认每个 DStools 进程使用八个 CPU 线程。由于计算节点不能解析 `data.csiro.au`，
+默认禁止 CASDA 下载；登录节点准备步骤会留下 tar 供 worker 解压。墙钟导致的 partial
+结果会写入 checkpoint，生成的 sbatch wrapper 可以自动重新提交。
 """
 
 from __future__ import annotations
@@ -14,7 +22,6 @@ import os
 import re
 import shutil
 import subprocess
-import tarfile
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,7 +34,6 @@ from astropy.table import Table
 
 try:
     from . import config
-    from .casda_query import build_casda_client, download_source_table
     from .crop_fits import crop_fits
     from .pipeline_utils import (
         atomic_write_json,
@@ -36,15 +42,16 @@ try:
         obs_number,
         read_json,
         read_t_min_map,
+        read_t_min_map_from_table,
         safe_source_name,
         sb_number_from_name,
         source_product_root,
         utc_now,
         write_source_state,
     )
-except ImportError:  # Script execution from the deployed program directory.
+    from .staging import decompress_and_move
+except ImportError:  # Deployed-directory script mode / 部署目录直接脚本模式。
     import config
-    from casda_query import build_casda_client, download_source_table
     from crop_fits import crop_fits
     from pipeline_utils import (
         atomic_write_json,
@@ -53,102 +60,50 @@ except ImportError:  # Script execution from the deployed program directory.
         obs_number,
         read_json,
         read_t_min_map,
+        read_t_min_map_from_table,
         safe_source_name,
         sb_number_from_name,
         source_product_root,
         utc_now,
         write_source_state,
     )
+    from staging import decompress_and_move
 
 logger = logging.getLogger("askap.process_job")
 
 
 class NotEnoughTime(RuntimeError):
-    """Raised when starting another subprocess would exceed the walltime reserve."""
+    """Signal that another subprocess would cross the walltime reserve.
+
+    中文：表示启动另一个子进程会越过预留的 walltime 安全窗口。
+    """
 
 
 class ProcessingError(RuntimeError):
-    """Raised when one SB cannot be completed."""
+    """Signal that one SB cannot be completed by the worker.
+
+    中文：表示 worker 无法完成一个 SB 的处理。
+    """
 
 
 def _remove_path(path: Path) -> None:
+    """Remove a file, directory, or symlink used by retry cleanup.
+
+    中文：删除重试清理阶段使用的文件、目录或符号链接。
+    """
+
     if path.is_dir() and not path.is_symlink():
         shutil.rmtree(path)
     elif path.exists():
         path.unlink()
 
 
-def _safe_extract(archive: Path, destination: Path) -> None:
-    destination_resolved = destination.resolve()
-    with tarfile.open(archive, mode="r:*") as tar:
-        for member in tar.getmembers():
-            if member.issym() or member.islnk() or not (member.isdir() or member.isfile()):
-                raise ProcessingError(
-                    f"Unsupported link/device in archive {archive}: {member.name}"
-                )
-            target = (destination / member.name).resolve()
-            if os.path.commonpath((str(destination_resolved), str(target))) != str(
-                destination_resolved
-            ):
-                raise ProcessingError(f"Unsafe archive member in {archive}: {member.name}")
-        tar.extractall(destination)
-
-
-def decompress_and_move(longobs: Path) -> None:
-    """Extract CASDA archives and move each raw MS into SB*_beam* folders."""
-
-    longobs.mkdir(parents=True, exist_ok=True)
-    for stale in longobs.glob(".extract-*"):
-        _remove_path(stale)
-    archives = sorted(
-        path
-        for path in longobs.iterdir()
-        if path.is_file()
-        and (
-            path.name.endswith(".tar")
-            or path.name.endswith(".tar.gz")
-            or path.name.endswith(".tgz")
-        )
-    )
-    for archive in archives:
-        logger.info("Extracting %s", archive)
-        temporary = longobs / f".extract-{archive.name}-{os.getpid()}"
-        _remove_path(temporary)
-        temporary.mkdir(parents=True, exist_ok=True)
-        try:
-            _safe_extract(archive, temporary)
-            for extracted in temporary.iterdir():
-                target = longobs / extracted.name
-                if target.exists():
-                    # Replacing an interrupted extraction is safer than
-                    # merging a possibly incomplete MeasurementSet.
-                    _remove_path(target)
-                shutil.move(str(extracted), str(target))
-        except Exception:
-            _remove_path(temporary)
-            raise
-        _remove_path(temporary)
-        archive.unlink()
-
-    # Checksums are useful during download but are not needed by DStools.
-    for checksum in longobs.glob("*.checksum"):
-        checksum.unlink()
-
-    for ms_path in sorted(longobs.glob("*.ms")):
-        match = re.search(r"(SB\d+).*?(beam\d+)", ms_path.name)
-        if not match:
-            logger.warning("Cannot derive SB folder from %s", ms_path.name)
-            continue
-        sb_folder = longobs / f"{match.group(1)}_{match.group(2)}"
-        sb_folder.mkdir(parents=True, exist_ok=True)
-        target = sb_folder / ms_path.name
-        if target.exists():
-            _remove_path(ms_path)
-        else:
-            shutil.move(str(ms_path), str(target))
-
-
 def _find_ms(sb_dir: Path) -> Path | None:
+    """Find a valid raw MeasurementSet in an SB directory.
+
+    中文：在 SB 目录中查找有效的原始 MeasurementSet。
+    """
+
     candidates = sorted(
         path
         for path in sb_dir.iterdir()
@@ -161,11 +116,21 @@ def _find_ms(sb_dir: Path) -> Path | None:
 
 
 def _find_subtracted_ms(sb_dir: Path) -> Path | None:
+    """Find a DStools-subtracted MeasurementSet in an SB directory.
+
+    中文：在 SB 目录中查找 DStools 生成的减源 MeasurementSet。
+    """
+
     candidates = sorted(sb_dir.glob("*.subtracted.ms"))
     return candidates[0] if candidates else None
 
 
 def _valid_ds(path: Path) -> bool:
+    """Check that a DS file contains the required HDF5 datasets.
+
+    中文：检查 DS 文件是否包含所需的 HDF5 dataset。
+    """
+
     try:
         with h5py.File(path, "r") as handle:
             return {"time", "frequency", "flux"}.issubset(handle.keys())
@@ -174,6 +139,11 @@ def _valid_ds(path: Path) -> bool:
 
 
 def _find_ds(sb_dir: Path) -> Path | None:
+    """Return the first valid DS product and remove invalid candidates.
+
+    中文：返回第一个有效 DS 产物，并删除无效候选文件。
+    """
+
     for candidate in sorted(sb_dir.glob("*.ds")):
         if _valid_ds(candidate):
             return candidate
@@ -183,6 +153,11 @@ def _find_ds(sb_dir: Path) -> Path | None:
 
 
 def _valid_fits(path: Path) -> bool:
+    """Check that a FITS image opens and contains non-empty data.
+
+    中文：检查 FITS 图像可以打开且包含非空数据。
+    """
+
     try:
         with fits.open(path, memmap=False) as hdul:
             return hdul[0].data is not None and hdul[0].data.size > 0
@@ -191,6 +166,11 @@ def _valid_fits(path: Path) -> bool:
 
 
 def _find_model_images(model_dir: Path) -> list[Path]:
+    """Return the expected WSClean Stokes-I and Stokes-V image paths.
+
+    中文：返回预期的 WSClean Stokes-I 和 Stokes-V 图像路径。
+    """
+
     return [
         model_dir / "wsclean-MFS-I-image.fits",
         model_dir / "wsclean-MFS-V-image.fits",
@@ -198,6 +178,11 @@ def _find_model_images(model_dir: Path) -> list[Path]:
 
 
 def _remaining_seconds(deadline: float | None) -> float | None:
+    """Return usable seconds after enforcing the configured reserve.
+
+    中文：扣除配置的 reserve 后返回可用秒数。
+    """
+
     if deadline is None:
         return None
     remaining = deadline - time.monotonic()
@@ -208,6 +193,11 @@ def _remaining_seconds(deadline: float | None) -> float | None:
 
 
 def _command_timeout(deadline: float | None) -> int | None:
+    """Convert the remaining walltime into a subprocess timeout.
+
+    中文：把剩余 walltime 转换为子进程 timeout。
+    """
+
     remaining = _remaining_seconds(deadline)
     if remaining is None:
         return None
@@ -220,7 +210,10 @@ def _run_dstools(
     log_path: Path,
     deadline: float | None,
 ) -> None:
-    """Run one container command and append stdout/stderr to the SB log."""
+    """Run one container command and append stdout/stderr to the SB log.
+
+    中文：运行一个容器命令，并把 stdout/stderr 追加到 SB 日志。
+    """
 
     timeout = _command_timeout(deadline)
     env = os.environ.copy()
@@ -256,10 +249,25 @@ def _run_dstools(
 
 
 def _container_command(*arguments: str) -> list[str]:
+    """Build an Apptainer command for the configured DStools image.
+
+    中文：为配置的 DStools 镜像构造 Apptainer 命令。
+    """
+
     return [config.APPTAINER_BIN, "exec", str(config.CONTAINER), *arguments]
 
 
 def _proper_motion_position(source: dict[str, Any], sb_name: str, t_min_map: dict[int, float]) -> tuple[float, float]:
+    """Apply the source proper motion at the effective observation epoch.
+
+    English: `t_min_map` already combines legacy CSV values with CASDA ECSV
+    values, with CASDA taking precedence. Missing finite values use MJD
+    `61041.5`.
+
+    中文：`t_min_map` 已经合并旧 CSV 和 CASDA ECSV 值，并由 CASDA 优先覆盖。缺少
+    有限值时使用 MJD `61041.5`。
+    """
+
     sb_number = sb_number_from_name(sb_name)
     t_min = t_min_map.get(sb_number, config.DEFAULT_T_MIN) if sb_number is not None else config.DEFAULT_T_MIN
     if sb_number is not None and sb_number not in t_min_map:
@@ -278,6 +286,11 @@ def _copy_products(
     ds_path: Path,
     model_dir: Path,
 ) -> None:
+    """Copy a validated DS and model images into an atomic product directory.
+
+    中文：将经过验证的 DS 和 model 图像原子地复制到产物目录。
+    """
+
     temporary = product_sb_dir.parent / (
         f".{product_sb_dir.name}.tmp-{os.getpid()}-{threading.get_ident()}"
     )
@@ -309,7 +322,15 @@ def process_sb(
     t_min_map: dict[int, float],
     deadline: float | None,
 ) -> dict[str, Any]:
-    """Process one SB folder and atomically promote its final products."""
+    """Process one SB folder and atomically promote its final products.
+
+    English: DStools preprocessing, model creation, subtraction, DS extraction,
+    FITS cropping, and product validation are checkpoint-safe. Staging data is
+    removed only after the DS and required Stokes-I image are copied.
+
+    中文：DStools 预处理、model 创建、减源、DS 提取、FITS 裁剪和产物验证都适合
+    checkpoint 恢复。只有 DS 和必需的 Stokes-I 图像复制成功后才删除 staging 数据。
+    """
 
     started = time.monotonic()
     sb_name = sb_dir.name
@@ -343,6 +364,7 @@ def process_sb(
 
             # DStools' ASKAP correction is required before imaging. FIELD_OLD
             # is the marker written by fix-ms after the correction succeeds.
+            # 成像前必须完成 DStools ASKAP 校正；fix-ms 成功后写入 FIELD_OLD 标记。
             if not (ms_path / "FIELD_OLD").exists():
                 _run_dstools(
                     _container_command("dstools-askap-preprocess", str(ms_path)),
@@ -444,8 +466,9 @@ def process_sb(
 
         _copy_products(sb_dir, product_sb_dir, ds_path, model_dir)
 
-        # Only delete staging data after the DS and required image are in the
-        # persistent product tree.  This makes retrying an interrupted job safe.
+        # Delete staging only after DS and the required image reach the
+        # persistent product tree; this makes interrupted retries safe.
+        # 只有 DS 和必需图像进入持久化产物树后才删除 staging，保证中断重试安全。
         _remove_path(sb_dir)
         _remove_path(temp_dir)
         return {
@@ -463,8 +486,9 @@ def process_sb(
     except Exception as exc:
         logger.exception("Processing failed for %s", sb_name)
         if _find_ms(sb_dir) is None and _find_ds(sb_dir) is None:
-            # An empty or incomplete extraction directory must not suppress a
+            # Do not let an empty/incomplete extraction directory suppress a
             # fresh CASDA download on the next job.
+            # 空或不完整的解压目录不能阻止下一个 job 重新下载 CASDA 数据。
             _remove_path(sb_dir)
         return {
             "sb": sb_name,
@@ -475,6 +499,11 @@ def process_sb(
 
 
 def _discover_sb_dirs(longobs: Path) -> list[Path]:
+    """List extracted SB/beam directories for one source.
+
+    中文：列出一个源已经解压出的 SB/beam 目录。
+    """
+
     return sorted(
         path
         for path in longobs.iterdir()
@@ -483,6 +512,11 @@ def _discover_sb_dirs(longobs: Path) -> list[Path]:
 
 
 def _expected_numbers(source: dict[str, Any]) -> set[int]:
+    """Extract expected numeric observations from a manifest source.
+
+    中文：从 manifest source 中提取预期的数字观测编号。
+    """
+
     return {
         number
         for value in source.get("obs_ids", [])
@@ -491,6 +525,11 @@ def _expected_numbers(source: dict[str, Any]) -> set[int]:
 
 
 def _deadline_from_args(started: float, walltime_hours: float) -> float:
+    """Calculate a deadline using configured time and Slurm's end timestamp.
+
+    中文：结合配置的 walltime 和 Slurm 结束时间戳计算 deadline。
+    """
+
     configured = started + walltime_hours * 3600
     raw_slurm_end = os.environ.get("SLURM_JOB_END_TIME")
     if raw_slurm_end:
@@ -502,6 +541,11 @@ def _deadline_from_args(started: float, walltime_hours: float) -> float:
 
 
 def _has_time_for_wave(deadline: float, number_of_sb: int) -> bool:
+    """Return whether one more SB wave fits before the reserve.
+
+    中文：判断再运行一个 SB wave 是否能在 reserve 前完成。
+    """
+
     remaining = deadline - time.monotonic()
     estimated = (
         np.ceil(number_of_sb / config.PARALLEL_SLOTS)
@@ -513,6 +557,11 @@ def _has_time_for_wave(deadline: float, number_of_sb: int) -> bool:
 
 
 def _cleanup_source_scratch(source_name: str) -> None:
+    """Remove completed source staging and temporary WSClean scratch.
+
+    中文：删除已完成源的 staging 和 WSClean 临时 scratch。
+    """
+
     _remove_path(config.STAGING_ROOT / source_name)
     for path in config.WSCLEAN_TEMP_ROOT.glob(f"{source_name}_*"):
         _remove_path(path)
@@ -522,7 +571,18 @@ def process_source(
     source: dict[str, Any],
     t_min_map: dict[int, float],
     deadline: float,
+    allow_compute_download: bool = False,
 ) -> str:
+    """Process one source, resuming from products and staged checkpoints.
+
+    English: The source is decompressed on compute immediately before DStools.
+    CASDA ECSV `t_min` values override legacy CSV values, and missing epochs use
+    the configured fallback. A partial source is left for automatic resubmission.
+
+    中文：在计算节点、紧邻 DStools 处理前解压当前源。CASDA ECSV 的 `t_min` 覆盖旧
+    CSV，缺失 epoch 使用配置 fallback。partial 源保留状态供自动重新提交。
+    """
+
     source_name = safe_source_name(source["source_name"])
     staging_longobs = config.STAGING_ROOT / source_name / "LongObs"
     product_longobs = source_product_root(source["ucs_number"], source_name)
@@ -544,11 +604,28 @@ def process_source(
         completed_sb=sorted(completed),
     )
 
-    # Query tables are cached by ozstar_main.  Reusing the cache also means a
-    # resumed job does not perform a second TAP query.  Only one wave of
-    # observations is downloaded at a time, so a source with many SBs never
-    # leaves all of its raw MS files on disk simultaneously.
+    # Login preparation leaves archives untouched. Extract only this source on
+    # compute immediately before its DStools work; other archives stay unopened.
+    # 登录节点准备不会动 archive；计算节点只在 DStools 前解压当前源，其他 archive 保持
+    # staging 且不打开。
+    decompress_and_move(staging_longobs)
+
+    # ozstar_main caches query tables. Reusing them prevents a resumed job from
+    # issuing another TAP query; login preparation normally staged the raw MS.
+    # query table 由 ozstar_main 缓存，恢复运行不会再次 TAP 查询；登录准备通常已放置 raw MS。
     rows = Table.read(source["query_cache"], format="ascii.ecsv")
+    csv_t_min_map = t_min_map
+    casda_t_min_map = read_t_min_map_from_table(rows)
+    effective_t_min_map = dict(csv_t_min_map)
+    effective_t_min_map.update(casda_t_min_map)
+    logger.info(
+        "%s: proper-motion t_min sources: CASDA=%d, legacy CSV fallback=%d, "
+        "default MJD=%.1f",
+        source_name,
+        len(casda_t_min_map),
+        len(set(csv_t_min_map).difference(casda_t_min_map)),
+        config.DEFAULT_T_MIN,
+    )
     client = None
     partial_seen = False
     failed_seen = False
@@ -571,6 +648,15 @@ def process_source(
             pending_numbers = expected.difference(completed, failed_numbers)
             if not pending_numbers:
                 break
+            if not allow_compute_download:
+                missing = ", ".join(
+                    f"SB{number}" for number in sorted(pending_numbers)
+                )
+                raise ProcessingError(
+                    f"{source_name}: required staged data is absent for {missing}. "
+                    "Compute nodes cannot access CASDA; run ozstar_main.py "
+                    "--prepare-download on a login node before submitting."
+                )
             if not _has_time_for_wave(
                 deadline, min(config.PARALLEL_SLOTS, len(pending_numbers))
             ):
@@ -583,13 +669,16 @@ def process_source(
                 if obs_number(value) in pending_numbers
             ]
             if not pending_rows:
-                logger.error(
-                    "%s: expected observations have no matching cached rows",
-                    source_name,
+                raise ProcessingError(
+                    f"{source_name}: expected observations have no matching cached "
+                    "rows; cannot verify staged data"
                 )
-                failed_seen = True
-                break
             if client is None:
+                try:
+                    from .casda_query import build_casda_client, download_source_table
+                except ImportError:  # Deployed-directory script mode / 部署目录直接脚本模式。
+                    from casda_query import build_casda_client, download_source_table
+
                 client = build_casda_client()
             batch = rows[pending_rows[: config.PARALLEL_SLOTS]]
             success, failed = download_source_table(
@@ -621,7 +710,7 @@ def process_source(
                     source,
                     sb_dir,
                     product_longobs / sb_dir.name,
-                    t_min_map,
+                    effective_t_min_map,
                     deadline,
                 )] = sb_dir.name
             for future in as_completed(futures):
@@ -641,7 +730,8 @@ def process_source(
             break
 
     # Remove stale archives/checksums, but preserve incomplete SB directories
-    # for the next job when a download or DStools command failed.
+    # for the next job after a download or DStools failure.
+    # 清理残留 archive/checksum，但下载或 DStools 失败时保留不完整 SB 目录供下次运行。
     for path in (staging_longobs.iterdir() if staging_longobs.exists() else []):
         if path.is_file() and (
             path.name.endswith(".checksum")
@@ -673,7 +763,19 @@ def process_source(
     return status
 
 
-def process_manifest(manifest: dict[str, Any]) -> int:
+def process_manifest(
+    manifest: dict[str, Any], allow_compute_download: bool = False
+) -> int:
+    """Process manifest sources serially and return Slurm worker status.
+
+    English: Zero means every source completed; the dedicated partial code
+    means the generated sbatch wrapper should resubmit; any other non-zero
+    result represents a failure.
+
+    中文：零表示所有源完成；专用 partial code 表示生成的 sbatch wrapper 应自动
+    重提交；其他非零结果表示失败。
+    """
+
     started = time.monotonic()
     deadline = _deadline_from_args(started, float(manifest["job_walltime_hours"]))
     t_min_map = read_t_min_map(config.TIME_CSV_PATH)
@@ -686,7 +788,12 @@ def process_manifest(manifest: dict[str, Any]) -> int:
             interrupted = True
             break
         try:
-            status = process_source(source, t_min_map, deadline)
+            status = process_source(
+                source,
+                t_min_map,
+                deadline,
+                allow_compute_download=allow_compute_download,
+            )
         except Exception as exc:
             logger.exception("Source failed: %s", source["source_name"])
             write_source_state(
@@ -708,14 +815,30 @@ def process_manifest(manifest: dict[str, Any]) -> int:
     unprocessed = {
         source["source_name"] for source in manifest["sources"]
     }.difference(statuses)
-    return 0 if not interrupted and not unprocessed and all(
+    if not interrupted and not unprocessed and all(
         status == "complete" for status in statuses.values()
-    ) else 2
+    ):
+        return 0
+    if not any(status == "failed" for status in statuses.values()) and (
+        interrupted or any(status == "partial" for status in statuses.values())
+    ):
+        return config.PARTIAL_EXIT_CODE
+    return 1
 
 
 def main() -> None:
+    """Parse worker arguments and execute one prepared manifest.
+
+    中文：解析 worker 参数并执行一个已准备的 manifest。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--allow-compute-download",
+        action="store_true",
+        help="Debugging only: attempt CASDA downloads from the compute node.",
+    )
     args = parser.parse_args()
 
     config.ensure_directories()
@@ -727,7 +850,12 @@ def main() -> None:
     if not manifest:
         raise SystemExit(f"Manifest does not exist or is empty: {args.manifest}")
     manifest["manifest_path"] = str(args.manifest)
-    raise SystemExit(process_manifest(manifest))
+    raise SystemExit(
+        process_manifest(
+            manifest,
+            allow_compute_download=args.allow_compute_download,
+        )
+    )
 
 
 if __name__ == "__main__":
