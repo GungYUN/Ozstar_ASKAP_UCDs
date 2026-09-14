@@ -1,151 +1,273 @@
-# Ozstar ASKAP/UCD pipeline
+# Ozstar ASKAP/UCD Pipeline
 
-This directory is the Ozstar-side implementation described in
-`../Ozstar_ASKAP_Migration_Plan.md`.
+This directory contains the Ozstar-side ASKAP/UCD pipeline. The normal
+production command is run from an Ozstar login node inside `tmux` or `screen`.
+The controller is resumable and advances only from manifests, source-state
+JSON files, and verified filesystem products.
 
-The persistent work root is:
+本目录包含 Ozstar 侧 ASKAP/UCD 流水线。正常生产命令在 Ozstar 登录节点的
+`tmux` 或 `screen` 中执行。controller 可以恢复运行，并且只根据 manifest、源状态
+JSON 文件和经过验证的文件系统产物推进，不根据 Slurm 队列猜测科学处理是否完成。
 
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/
+## 1. First-Time Installation / 首次安装
+
+### English
+
+1. Put this program directory on Ozstar. From a machine that can SSH to Ozstar,
+   the optional deployment wrapper is:
+
+   ```bash
+   ./deploy_to_ozstar.sh
+   ```
+
+   The wrapper copies the directory below `OZSTAR_WORK` (default
+   `/fred/oz299/qhuang/ASKAP-UCDs`). It requires `sshpass` and either a
+   mode-600 transfer-password file or the one-process `TRANSFER_PASSWORD`
+   environment variable. It never prints a password.
+
+2. Copy the two input CSV files into the persistent catalogue directory:
+
+   ```text
+   /fred/oz299/qhuang/ASKAP-UCDs/catalogue/
+       UltracoolSheet_Main_index_unbinaryUCD.csv
+       All_combine_data_unrepetition.csv
+   ```
+
+   Use `ASKAP_CATALOGUE` and `ASKAP_TIME_CSV` when the files are mounted at
+   different paths. The catalogue must contain the UCS, name, coordinate,
+   proper-motion, and spectral-type columns used by `ozstar_main.py`.
+
+3. Create the persistent layout:
+
+   ```bash
+   cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
+   ./prepare_layout.sh
+   ```
+
+   The first Python run also creates `state/controllers/`. Do not put
+   visibility/MS data in `$TMPDIR`; `ASKAP_WORK` is the persistent root for
+   staging, products, state, checkpoints, and logs.
+
+4. Create the host-side Python environment:
+
+   ```bash
+   ./setup_host_python.sh
+   module load gcc/13.3.0
+   module load python/3.12.3
+   export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
+   export ASKAP_PYTHON_MODULE=python/3.12.3
+   export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+   $ASKAP_PYTHON_BIN -c \
+     'import numpy, pandas, astropy, h5py, astroquery, keyring; print("Python environment OK")'
+   ```
+
+   The setup script installs the packages in `requirements.txt` into the
+   persistent venv. It only loads the configured modules. It does **not** run
+   `module purge` or `module unload`; retain the existing site module/venv
+   handling.
+
+5. Confirm the DStools Apptainer image exists:
+
+   ```text
+   /fred/oz299/qhuang/dstools/dstools-v2.0.0.sif
+   ```
+
+   Override it with `DSTOOLS_CONTAINER` only when the intended image has been
+   validated. DStools, casacore, and WSClean run inside this image; the host
+   venv is for orchestration, TAP, ECSV, and state management.
+
+6. Configure credentials without placing secrets in this directory. For CASDA,
+   create a mode-600 file containing only the password at:
+
+   ```text
+   ~/.config/askap/casda-password
+   ```
+
+   Set `CASDA_USERNAME` if necessary. `CASDA_PASSWORD` is a one-process
+   override. The client uses an in-memory keyring backend, does not use the
+   obsolete `password=` login argument, and does not persist the password.
+
+### 中文
+
+1. 将本程序目录放到 Ozstar。可以在能够 SSH 到 Ozstar 的机器上使用可选部署脚本：
+
+   ```bash
+   ./deploy_to_ozstar.sh
+   ```
+
+   该脚本把目录复制到 `OZSTAR_WORK` 下，默认是
+   `/fred/oz299/qhuang/ASKAP-UCDs`。脚本需要 `sshpass`，以及 mode-600 的传输
+   密码文件或只对当前进程生效的 `TRANSFER_PASSWORD` 环境变量；它不会打印密码。
+
+2. 将两个输入 CSV 放入持久化 catalogue 目录：
+
+   ```text
+   /fred/oz299/qhuang/ASKAP-UCDs/catalogue/
+       UltracoolSheet_Main_index_unbinaryUCD.csv
+       All_combine_data_unrepetition.csv
+   ```
+
+   如果文件在其他挂载路径，使用 `ASKAP_CATALOGUE` 和 `ASKAP_TIME_CSV`。catalogue
+   必须包含 `ozstar_main.py` 使用的 UCS、名称、坐标、自行和光谱型列。
+
+3. 创建持久化目录：
+
+   ```bash
+   cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
+   ./prepare_layout.sh
+   ```
+
+   第一次运行 Python 程序时也会创建 `state/controllers/`。不要把 visibility/MS
+   数据放入 `$TMPDIR`；`ASKAP_WORK` 是 staging、产物、状态、checkpoint 和日志的
+   持久化根目录。
+
+4. 创建主机侧 Python 环境：
+
+   ```bash
+   ./setup_host_python.sh
+   module load gcc/13.3.0
+   module load python/3.12.3
+   export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
+   export ASKAP_PYTHON_MODULE=python/3.12.3
+   export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+   $ASKAP_PYTHON_BIN -c \
+     'import numpy, pandas, astropy, h5py, astroquery, keyring; print("Python environment OK")'
+   ```
+
+   setup 脚本把 `requirements.txt` 中的包安装到持久化 venv。它只加载配置的
+   module，不执行 `module purge` 或 `module unload`；保留现有的 site module/venv
+   处理方式。
+
+5. 确认 DStools 的 Apptainer 镜像存在：
+
+   ```text
+   /fred/oz299/qhuang/dstools/dstools-v2.0.0.sif
+   ```
+
+   只有在验证过目标镜像后才使用 `DSTOOLS_CONTAINER` 覆盖它。DStools、casacore
+   和 WSClean 在该镜像内运行；主机 venv 负责 orchestration、TAP、ECSV 和状态管理。
+
+6. 不要把密码放入本目录。CASDA 密码文件只包含密码本身，并且权限必须是 mode-600：
+
+   ```text
+   ~/.config/askap/casda-password
+   ```
+
+   必要时设置 `CASDA_USERNAME`。`CASDA_PASSWORD` 只作为当前进程的覆盖值。client
+   使用内存 keyring，不使用过时的 `password=` 登录参数，也不持久化密码。
+
+## 2. Every-Run Workflow and Changeable Parameters / 每次运行流程和可修改参数
+
+### English
+
+Run the controller on an Ozstar login node. The range is inclusive, and
+`--submit` includes login-node preparation, so a separate preparation command
+is not needed for normal production:
+
+```bash
+cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
+module load gcc/13.3.0
+module load python/3.12.3
+export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
+export ASKAP_PYTHON_MODULE=python/3.12.3
+export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
+export ASKAP_SBATCH_MEM=80G
+$ASKAP_PYTHON_BIN ozstar_main.py --begin 1501 --end 1901 --submit
 ```
 
-The program directory, catalogues, staging data, final products and state
-files are all below that root.  The pipeline does not use `$TMPDIR` for MS
-storage.
+The normal sequence is:
 
-## Files
+1. Load the catalogue and query CASDA TAP for each new source. The existing
+   quality, spectral-type, exposure, radius, size, release, and nearest-
+   `obs_id` filters are retained.
+2. Write the complete filtered and deduplicated TAP rows to
+   `state/tap_cache/*.ecsv`. Every returned column is retained, including
+   `access_estsize` and returned `t_min`/`t_max`.
+3. Sum the deduplicated `access_estsize` values. CASDA reports this field in
+   KB, so the sum is converted to bytes. A controller block contains at most
+   50 UCS numbers and is split before its estimate would exceed the 2 TB
+   staging budget (`2 * 1024**4` bytes by default). A single source above the
+   budget fails clearly. Current staging usage and actual free space below
+   `ASKAP_WORK` are checked before download.
+4. On the login node, authenticate to CASDA and download only visibility tar
+   archives (`.tar`, `.tar.gz`, `.tgz`) and their `.checksum` files. The login
+   node does **not** extract archives.
+5. Submit one short-name Slurm worker for the prepared block. On the compute
+   node, the worker extracts only the current source's archives, runs DStools,
+   crops the FITS images, atomically promotes products, and writes checkpoints.
+6. The login controller polls source state and filesystem products. It advances
+   only after each source is `complete`, `no_data`, or `skipped`; a `complete`
+   source must also have valid expected `.ds` and Stokes-I FITS products and no
+   unprocessed MS/archive residue in staging.
+7. When walltime protection returns the dedicated partial exit code, the
+   generated sbatch script automatically resubmits itself up to
+   `ASKAP_MAX_AUTO_RESUBMITS` (20 by default). No manual queue-based completion
+   decision is required.
 
-| File | Purpose |
+For a plan that writes TAP caches and manifests but neither downloads nor
+submits, use `--no-submit`. `--prepare-download` is retained for an explicit
+login-node preparation-only run. `--retry-existing` deliberately resets
+incomplete controller state; do not use it for an ordinary reconnect. The
+`--allow-compute-download` option is a debugging opt-in and is not part of the
+normal Ozstar network architecture.
+
+Changeable runtime settings are read when the process starts. The defaults
+below are the current operational defaults, not passwords or secret values:
+
+| Area | Setting | Default and meaning |
+|---|---|---|
+| Range | `--begin`, `--end` | Inclusive UCS range; preferred per-run controls. |
+| Range | `ASKAP_UCS_START`, `ASKAP_UCS_END` | Defaults used when CLI range arguments are omitted (`1`, `1000`). |
+| Persistent paths | `ASKAP_WORK` | `/fred/oz299/qhuang/ASKAP-UCDs`; contains staging, products, state, and logs. |
+| Input paths | `ASKAP_CATALOGUE`, `ASKAP_TIME_CSV` | Override the catalogue and legacy `obs_id` to `t_min` CSV paths. |
+| Memory | `ASKAP_SBATCH_MEM` | `80G`; Slurm worker memory. Set this before every run when needed. |
+| Scratch | `ASKAP_SBATCH_TMP` | `10G`; small Slurm scratch allocation only, not the MS/product store. |
+| Partition | `ASKAP_SBATCH_PARTITION` | Empty by default; set to a site-approved Slurm partition when required. |
+| Block/storage | `BLOCK_SIZE` | Fixed code limit of 50 UCS numbers per controller block; not a runtime override. |
+| Block/storage | `ASKAP_STAGING_BUDGET_BYTES` | `2 * 1024**4`; estimated staging admission budget. |
+| CASDA filtering | `ASKAP_CASDA_MAX_FILE_SIZE_KB` | Maximum filtered archive estimate per row. |
+| CASDA batching | `ASKAP_CASDA_STAGE_BATCH_SIZE`, `ASKAP_CASDA_QUERY_LIMIT` | CASDA staging batch size `20` and TAP row limit `5000`. |
+| Download retry | `ASKAP_CASDA_SOURCE_DOWNLOAD_RETRIES`, `ASKAP_CASDA_SOURCE_RETRY_DELAY_SECONDS` | Each source is retried `3` times with a `30` second delay; after exhaustion the controller records `download_failed` and continues. |
+| Time estimate | `ASKAP_HOURS_PER_OBS` | `3.0` hours per observation for packing and worker wave checks. |
+| Time estimate | `ASKAP_SOURCE_OVERHEAD_HOURS` | `0.5` hours per source in the controller estimate. |
+| Slurm time | `ASKAP_JOB_WALLTIME_HOURS` | `48` hours for generated workers; this is not a completion criterion. |
+| Walltime safety | `ASKAP_WALLTIME_RESERVE_MINUTES` | `20` minutes kept in reserve before a partial exit. |
+| CPU | `ASKAP_PARALLEL_SLOTS` | `4` concurrent SB waves. |
+| CPU | `ASKAP_CPU_PER_SLOT` | `8` threads per DStools process; total default is `4 x 8 = 32` CPUs. The product must not exceed 32. |
+| CPU | `ASKAP_CREATE_MODEL_THREADS` | Defaults to `ASKAP_CPU_PER_SLOT`; DStools model threads. |
+| Controller | `ASKAP_CONTROLLER_INITIAL_DELAY_SECONDS`, `ASKAP_CONTROLLER_POLL_INTERVAL_SECONDS` | `30` seconds and `60` seconds; filesystem polling timing only. CLI equivalents are available. |
+| Resubmission | `ASKAP_MAX_AUTO_RESUBMITS` | `20` automatic self-resubmissions after partial worker exit. |
+| Python/modules | `ASKAP_PYTHON_BIN`, `ASKAP_PYTHON_PARENT_MODULE`, `ASKAP_PYTHON_MODULE` | Host interpreter and module names used by generated workers. |
+| Container | `DSTOOLS_CONTAINER`, `APPTAINER_BIN` | DStools image and Apptainer executable. |
+
+The following processing controls are also environment-overridable when a
+scientific change is intentional: `ASKAP_DSTOOLS_BAND`,
+`ASKAP_CREATE_MODEL_ITERATIONS`, `ASKAP_MIN_UV_METRES`,
+`ASKAP_EXTRACT_MIN_UV_METRES`, `ASKAP_CROP_ARCMIN`,
+`ASKAP_SPTNUM_THRESHOLD`, `ASKAP_DEFAULT_T_MIN`, and `ASKAP_MJD_J2000`.
+The fallback `ASKAP_DEFAULT_T_MIN` is MJD `61041.5` (2026-01-01 12:00 UTC).
+`ASKAP_SAFETY_FACTOR`, `ASKAP_TARGET_OBS`, `ASKAP_MAX_SOURCES_PER_JOB`, and
+`ASKAP_SCAN_WINDOW` remain in `config.py` for compatibility with earlier
+packing settings; the current controller uses the fixed 50-UCS limit and live
+staging/free-space checks instead of those legacy knobs.
+
+Credentials and connection environment:
+
+| Purpose | Settings |
 |---|---|
-| `ozstar_main.py` | Query TAP, pack sources, write a manifest and submit Slurm |
-| `process_job.py` | Compute-node worker: download, extract, DStools, crop and checkpoint |
-| `casda_query.py` | CASDA filtering, staging and safe per-file download |
-| `crop_fits.py` | 10 arcmin FITS crop with a valid celestial WCS |
-| `transfer_products.py` | Password-assisted SCP/rsync in either direction |
-| `transfer_to_ada.sh` | Convenience wrapper for Ozstar → ada |
-| `transfer_to_ozstar.sh` | Convenience wrapper for ada → Ozstar |
-| `deploy_to_ozstar.sh` | Copy this program directory to the Ozstar work root |
-| `prepare_layout.sh` | Create the persistent Ozstar directory layout |
-| `setup_host_python.sh` | Create a venv host Python environment on Fred |
-| `config.py` | Central paths and resource settings |
+| CASDA login | `CASDA_USERNAME`, `CASDA_PASSWORD_FILE`, one-process `CASDA_PASSWORD` |
+| Transfer from Ozstar to ada | `ADA_SSH_USER`, `ADA_SSH_HOST`, `ADA_VISIBILITY_ROOT`, `ADA_PASSWORD_FILE` |
+| Transfer from ada to Ozstar | `OZSTAR_SSH_USER`, `OZSTAR_SSH_HOST`, `OZSTAR_PRODUCT_ROOT`, `OZSTAR_PASSWORD_FILE` |
+| Transfer password/tool | `TRANSFER_PASSWORD_FILE`, one-process `TRANSFER_PASSWORD`, `SSHPASS_BIN`, `ASKAP_SSH_CONNECT_TIMEOUT` |
 
-## Initial layout
+Use protected files by default. Environment passwords are deliberately
+short-lived overrides and must not be put in shell history, README files,
+manifests, or logs. The wrappers do not enable automatic transfer.
 
-Copy the two CSV files to the default locations, or set `ASKAP_CATALOGUE` and
-`ASKAP_TIME_CSV` in the environment:
+### 中文
 
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/catalogue/
-    UltracoolSheet_Main_index_unbinaryUCD.csv
-    All_combine_data_unrepetition.csv
-```
-
-Create the directories before the first run:
-
-```bash
-./prepare_layout.sh
-```
-
-To deploy/update this program directory from ada or a local Linux/macOS host,
-run `deploy_to_ozstar.sh`.  It uses the same mode-600 Ozstar password file and
-does not put the password in the SCP command:
-
-```bash
-./deploy_to_ozstar.sh
-```
-
-Alternatively, provide the Ozstar password only for one deployment without
-creating a local password file:
-
-```bash
-read -r -s TRANSFER_PASSWORD
-export TRANSFER_PASSWORD
-./deploy_to_ozstar.sh
-unset TRANSFER_PASSWORD
-```
-
-The DStools container must exist at:
-
-```text
-/fred/oz299/qhuang/dstools/dstools-v2.0.0.sif
-```
-
-The host Python environment needs `numpy`, `pandas`, `astropy`, `h5py` and
-`astroquery`.  DStools, casacore and WSClean are provided by the Apptainer
-container.  Create a venv on Fred with:
-
-```bash
-./setup_host_python.sh
-module load gcc/13.3.0
-module load python/3.12.3
-export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
-export ASKAP_PYTHON_MODULE=python/3.12.3
-export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
-export ASKAP_SBATCH_MEM=80G
-```
-
-The script only executes `module load`; it does not run `module purge`,
-`module unload` or remove any existing environment.  If the current shell
-already has the `mamba` module loaded and the Python module reports a conflict,
-start a new login shell and run the script there without loading `mamba`.
-
-Run the following block once at the start of every new login shell before
-planning or submitting a job.  It is not necessary to recreate the venv each
-time:
-
-```bash
-module load gcc/13.3.0
-module load python/3.12.3
-export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
-export ASKAP_PYTHON_MODULE=python/3.12.3
-export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
-export ASKAP_SBATCH_MEM=80G
-```
-
-The generated Slurm script loads `apptainer`, the configured parent GCC module
-and Python module, checks the imports, uses the venv interpreter, requests 32
-CPUs and 80G memory, and assigns a short job name such as `U1501-50`.
-
-## Credentials
-
-No password is stored in the program.  CASDA uses a mode-600 file containing
-only the CASDA password, or the `CASDA_PASSWORD` environment variable:
-
-```text
-~/.config/askap/casda-password
-```
-
-For SSH transfer, `sshpass` is required.  The recommended setup is a
-mode-600 password file on the machine initiating each direction:
-
-```bash
-mkdir -p ~/.config/askap
-read -r -s TRANSFER_PASSWORD
-printf '%s\n' "$TRANSFER_PASSWORD" > ~/.config/askap/transfer-password
-unset TRANSFER_PASSWORD
-chmod 600 ~/.config/askap/transfer-password
-```
-
-The file used for each direction can be changed with:
-
-```bash
-export ADA_PASSWORD_FILE="$HOME/.config/askap/ada-password"
-export OZSTAR_PASSWORD_FILE="$HOME/.config/askap/ozstar-password"
-```
-
-`to-ada` uses the password for the ada account.  `to-ozstar` uses the
-password for the Ozstar account.  As an alternative, set
-`TRANSFER_PASSWORD` only for the lifetime of the transfer command.  The
-password is passed to `sshpass` without appearing in the SCP command line or
-the program log.
-
-SSH host keys should be accepted and verified manually once before an
-automated transfer.  The transfer tool intentionally does not disable host
-key checking.
-
-## Plan and submit a job
-
-Run on the Ozstar login node.  First use a dry plan:
+controller 在 Ozstar 登录节点运行。范围两端都包含；`--submit` 已经包含登录节点
+准备步骤，正常生产不需要另行执行 prepare 命令：
 
 ```bash
 cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
@@ -155,398 +277,95 @@ export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
 export ASKAP_SBATCH_MEM=80G
-$ASKAP_PYTHON_BIN ozstar_main.py --begin 1 --end 50 --no-submit
+$ASKAP_PYTHON_BIN ozstar_main.py --begin 1501 --end 1901 --submit
 ```
 
-When the manifest is correct, submit it:
-
-```bash
-$ASKAP_PYTHON_BIN ozstar_main.py --begin 1 --end 50 --submit
-```
-
-The same range can be set at the top of `ozstar_main.py` by changing
-`UCS_START`, `UCS_END` and `SUBMIT`.  `--retry-existing` is required when a
-previous `complete`, `queued` or `running` state should deliberately be
-replanned.
-
-The default packer uses 4 slots × 8 CPU, estimates 4 hours per observation,
-targets 40 observations and requests 48 hours with 80G memory.  These values are all in
-`config.py` and can be overridden with environment variables.
-
-The generated Slurm job name is shortened to the form `U<start>-<count>`, for
-example `U1501-50`.  Manifest and sbatch filenames retain a timestamp so that
-repeated submissions do not overwrite one another.
-
-Each source is downloaded in waves of at most four observations.  A wave is
-processed before the next wave is downloaded.  Therefore a source with many
-observations does not leave all of its MS files in `staging/` at once.
-
-## Transfer products to ada
-
-Run on Ozstar after the Slurm job has produced products:
-
-```bash
-cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
-./transfer_to_ada.sh --batch UCS1-50
-```
-
-Multiple batches can be transferred in one invocation:
-
-```bash
-./transfer_to_ada.sh --batch UCS1-50 --batch UCS51-100
-```
-
-The default source is `products/`; the default ada destination is:
-
-```text
-/import/ada1/qhua0119/Visibility/
-```
-
-Only `.ds` files and the two WSClean MFS image names are transferred and
-verified.  Verification compares every relative product path and SHA-256
-digest; the source is retained unless `--delete-source` is supplied:
-
-```bash
-./transfer_to_ada.sh --batch UCS1-50 --delete-source
-```
-
-Deletion happens only after the remote product paths and SHA-256 digests match
-the local batch.
-For Ozstar → ada deletion, every source in the batch must also have a
-`complete` state in `state/sources/`.  Reverse-transfer deletion is refused by
-default because ada has no Ozstar worker state; only use
-`--allow-delete-without-state` after manual verification.
-
-## Reverse transfer
-
-The same code can copy ada-compatible batch trees back to Ozstar.  Run the
-program on ada, with this directory available there:
-
-```bash
-python3 transfer_products.py \
-  --direction to-ozstar \
-  --source-root /import/ada1/qhua0119/Visibility \
-  --batch UCS1-50
-```
-
-The default remote destination is
-`/fred/oz299/qhuang/ASKAP-UCDs/products/`.  Use `--remote-root` to select a
-different Ozstar directory.
-
-## ada plotting
-
-After transfer, confirm the expected tree exists under ada's `Visibility/`
-directory.  Run the existing ada main with download, decompression and
-DStools disabled, and plotting/combining enabled:
-
-```python
-STEPS = {
-    "download_visibility": False,
-    "decompress_move": False,
-    "dstool_process": False,
-    "plot_images": True,
-    "combine_images": True,
-}
-```
-
-The 10 arcmin WCS-preserving images are sufficient for the existing 1 arcmin,
-3 arcmin and 60 arcsec plotting products.
-
-## State and recovery
-
-State is stored below `state/`:
-
-```text
-state/tap_cache/       TAP ECSV results
-state/sources/         per-source status and SB checkpoints
-state/jobs/             manifests and generated sbatch scripts
-```
-
-An existing `.ds` plus Stokes-I FITS product is treated as complete for that
-SB.  Failed SB directories remain in `staging/` for a later retry.  A job
-that reaches its walltime reserve exits with `partial`; the next manifest can
-resume the same source.
-
----
-
-# 中文使用说明
-
-本目录是运行在 Ozstar 上的 ASKAP/UCD 处理程序组。程序负责 CASDA 查询和下载、
-解压、DStools 处理、FITS 裁剪以及 Slurm 提交；最终的 DS/Cutout/Contour 绘图和
-图像拼接仍在 HPC-ada 上使用原有程序完成。
-
-## 中文 1：固定路径和目录
-
-Ozstar 的持久化工作目录为：
-
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/
-```
-
-程序、目录、catalogue、临时处理数据、最终产品和状态文件均位于该目录下。MS
-数据不放在 `$TMPDIR` 中。
-
-主要目录结构为：
-
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/
-    ozstar_askap/       # 程序
-    catalogue/          # 两个 CSV 文件
-    staging/            # 当前正在处理的 tar/MS
-    products/           # 已完成的 .ds 和裁剪 FITS
-    state/              # TAP cache、manifest、source 状态、SB checkpoint
-    logs/               # Slurm 和 SB 日志
-```
-
-首先创建目录：
-
-```bash
-cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
-./prepare_layout.sh
-```
-
-需要存在以下两个 CSV：
-
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/catalogue/UltracoolSheet_Main_index_unbinaryUCD.csv
-/fred/oz299/qhuang/ASKAP-UCDs/catalogue/All_combine_data_unrepetition.csv
-```
-
-第二个 CSV 用于读取每个 SB 的 `t_min`，计算自行运动修正。建议不要省略。
-
-## 中文 2：部署和 host Python 环境
-
-从 ada 或本地 Linux/macOS 主机更新程序目录：
-
-```bash
-./deploy_to_ozstar.sh
-```
-
-该程序组需要一个 host Python 环境，用于运行 TAP 查询、manifest 生成和计算节点
-上的调度脚本。DStools、casacore 和 WSClean 仍由 Apptainer 容器提供。
-
-建议重新登录一个干净的 Ozstar shell，不要在已经加载 `mamba` 的 shell 中强行
-加载 Python module。下面的脚本只执行 `module load`，不会执行 `module purge`、
-`module unload`，也不会删除已有环境：
-
-```bash
-cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
-./setup_host_python.sh
-```
-
-然后在当前 shell 中加载与 venv 创建时相同的 Python module：
-
-```bash
-module load gcc/13.3.0
-module load python/3.12.3
-export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
-export ASKAP_PYTHON_MODULE=python/3.12.3
-export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
-export ASKAP_SBATCH_MEM=80G
-```
-
-验证环境：
-
-```bash
-$ASKAP_PYTHON_BIN -c \
-'import numpy, pandas, astropy, h5py, astroquery; print("Python environment OK")'
-```
-
-以后不要用没有 numpy 的系统 `python3` 或 `python` 运行 `ozstar_main.py`。如果
-集群提供的 Python 版本不是 `3.12.3`，先运行 `module spider python`，然后设置
-正确的 `ASKAP_PYTHON_MODULE`。
-
-DStools 容器必须位于：
-
-```text
-/fred/oz299/qhuang/dstools/dstools-v2.0.0.sif
-```
-
-## 中文 3：密码和 SSH 传输
-
-程序不会保存密码。CASDA 密码可以放在以下 mode-600 文件中：
-
-```bash
-mkdir -p ~/.config/askap
-read -r -s CASDA_PASSWORD
-printf '%s\n' "$CASDA_PASSWORD" > ~/.config/askap/casda-password
-unset CASDA_PASSWORD
-chmod 600 ~/.config/askap/casda-password
-```
-
-Ozstar 向 ada 传输时，需要保存 ada 账号的密码：
-
-```bash
-read -r -s ADA_PASSWORD
-printf '%s\n' "$ADA_PASSWORD" > ~/.config/askap/ada-password
-unset ADA_PASSWORD
-chmod 600 ~/.config/askap/ada-password
-export ADA_PASSWORD_FILE="$HOME/.config/askap/ada-password"
-```
-
-传输程序需要 `sshpass`。密码通过 `sshpass` 自动填写，不会出现在源码或打印的
-SCP 命令中。第一次连接两台服务器时，建议先人工确认 SSH host key。
-
-## 中文 4：处理源编号和光谱型筛选
-
-`--begin` 和 `--end` 都是包含端点的 UCS 编号范围。例如处理 UCS1501 至 UCS1550：
-
-```bash
---begin 1501 --end 1550
-```
-
-当前代码使用原 ada 程序的筛选逻辑：
-
-```text
-sptnumabs_formula >= 20
-```
-
-光谱型不满足条件、没有可用 CASDA 数据或已完成的源会被自动跳过。
-
-## 中文 5：先生成处理计划
-
-在 Ozstar 登录节点执行：
-
-```bash
-cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
-module load gcc/13.3.0
-module load python/3.12.3
-export ASKAP_PYTHON_MODULE=python/3.12.3
-export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
-
-$ASKAP_PYTHON_BIN ozstar_main.py \
-  --begin 1501 \
-  --end 1550 \
-  --no-submit
-```
-
-`--no-submit` 只进行以下操作：
-
-- 读取源 catalogue；
-- 通过 TAP 查询每个源的观测数；
-- 应用 `sptnumabs_formula >= 20` 和 CASDA 数据筛选；
-- 按估计观测数打包任务；
-- 生成 manifest 和 Slurm 脚本；
-- 不下载数据，也不占用计算节点。
-
-manifest 位于：
-
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/state/jobs/
-```
-
-可以查看最新的任务文件：
-
-```bash
-ls -lt /fred/oz299/qhuang/ASKAP-UCDs/state/jobs/
-```
-
-默认配置为 4 个并行槽、每槽 8 CPU、每次目标约 40 次观测、48 小时墙钟，具体
-并请求 80G 内存。具体参数位于 `config.py`，也可以通过环境变量覆盖。
-
-生成的 Slurm 作业名采用 `U<起始序号>-<总数>` 格式，例如
-`U1501-50`。manifest 和 sbatch 文件名仍保留时间戳，重复提交不会互相覆盖。
-
-## 中文 6：提交 Slurm 任务
-
-确认 manifest 中的源列表和观测数无误后提交：
-
-```bash
-$ASKAP_PYTHON_BIN ozstar_main.py \
-  --begin 1501 \
-  --end 1550 \
-  --submit
-```
-
-生成的 Slurm 作业会自动：
-
-- 加载 `apptainer`；
-- 加载 `gcc/13.3.0` 作为 Python module 的父 module；
-- 加载 `ASKAP_PYTHON_MODULE` 指定的 Python module；
-- 使用 `ASKAP_PYTHON_BIN` 指定的 venv Python；
-- 检查 numpy、pandas、astropy、h5py 和 astroquery；
-- 请求 32 个 CPU 和 80G 内存；
-- 使用 `U<起始序号>-<总数>` 格式的短作业名，例如 `U1501-50`；
-- 在计算节点运行 `process_job.py`。
-
-查看任务：
-
-```bash
-squeue -u qhuang
-```
-
-任务结束后查看：
-
-```bash
-sacct -j JOBID --format=JobID,State,Elapsed,ExitCode
-```
-
-如果作业因为达到墙钟保护而返回 `partial`，不一定表示数据损坏；应检查
-`state/sources/` 中每个源的状态。
-
-## 中文 7：Ozstar 端实际处理逻辑
-
-每个源按以下顺序处理：
-
-1. 从 CASDA 下载当前波次的最多 4 个观测；
-2. 将 tar 文件解压并移动到 `SBXXXXX_beamYY/`；
-3. 运行 `dstools-askap-preprocess`；
-4. 运行 `dstools-create-model`，每个任务使用 8 CPU；
-5. 运行自动位置 mask 的 `dstools-insert-model`；
-6. 运行 `dstools-subtract-model`；
-7. 运行 `dstools-extract-ds` 生成 `.ds`；
-8. 将 Stokes I/V FITS 裁剪到 10′×10′；
-9. 将 `.ds` 和 FITS 写入 `products/`；
-10. 删除该 SB 的 MS 和中间文件。
-
-同一源最多同时处理 4 个 SB。当前源处理完一波后，才下载下一波，因此不会把
-一个源的全部原始 MS 同时堆积在磁盘上。
-
-## 中文 8：继续处理后续源
-
-一次 Slurm 任务通常只处理部分源。前一个任务完成后，重复运行相同范围的计划：
-
-```bash
-$ASKAP_PYTHON_BIN ozstar_main.py \
-  --begin 1501 \
-  --end 1550 \
-  --no-submit
-```
-
-检查新的 manifest 后再提交：
-
-```bash
-$ASKAP_PYTHON_BIN ozstar_main.py \
-  --begin 1501 \
-  --end 1550 \
-  --submit
-```
-
-程序会根据 source state 跳过 `complete`、`queued` 和 `running` 源，并继续选择
-后面的未完成源。前一个任务仍在 `queued` 或 `running` 时，不要重复提交同一范围。
-
-如果希望重新查询 CASDA，而不是使用已有 TAP cache，可以使用：
-
-```bash
-$ASKAP_PYTHON_BIN ozstar_main.py \
-  --begin 1501 \
-  --end 1550 \
-  --refresh-cache \
-  --no-submit
-```
-
-`--retry-existing` 只在确实需要重新计划已经处于 `complete`、`queued` 或 `running`
-状态的源时使用，正常断点续跑不需要该参数。
-
-## 中文 9：输出目录
-
-UCS1501–UCS1550 属于同一个 50 源目录：
-
-```text
-/fred/oz299/qhuang/ASKAP-UCDs/products/UCS1501-1550/
-```
-
-单个源的输出结构类似：
+正常顺序如下：
+
+1. 读取 catalogue，并为每个新源查询 CASDA TAP。保留原有的质量、光谱型、曝光、
+   半径、大小、release 和最近 `obs_id` 筛选。
+2. 把完整的过滤和去重后的 TAP 行写入 `state/tap_cache/*.ecsv`。TAP 返回的每一列
+   都会保留，包括 `access_estsize` 以及返回时存在的 `t_min`/`t_max`。
+3. 对去重后的 `access_estsize` 求和。CASDA 的单位是 KB，因此会转换为 bytes。每个
+   controller block 最多包含 50 个 UCS 编号，并在估计值即将超过 2 TB staging 上限
+   （默认 `2 * 1024**4` bytes）前拆分。单个源超过上限会明确失败。下载前还会检查
+   当前 staging 占用和 `ASKAP_WORK` 的实际剩余空间。
+4. 登录节点向 CASDA 登录，只下载 visibility tar 压缩包（`.tar`、`.tar.gz`、`.tgz`）
+   和对应的 `.checksum`。登录节点**不解压**压缩包。
+5. 为准备好的 block 提交短名称 Slurm worker。计算节点只解压当前源的压缩包，运行
+   DStools、裁剪 FITS、原子地提升产物并写入 checkpoint。
+6. 登录节点 controller 轮询源状态和文件系统产物。只有每个源为 `complete`、`no_data`
+   或 `skipped` 才会推进；`complete` 还必须有有效的预期 `.ds`、Stokes-I FITS，且
+   staging 中没有未处理的 MS 或 archive 残留。
+7. worker 因墙钟保护返回专用 partial exit code 时，生成的 sbatch 会自动重新提交自己，
+   默认最多 `ASKAP_MAX_AUTO_RESUBMITS=20` 次。不需要人工根据队列判断完成。
+
+只生成 TAP cache 和 manifest、不下载也不提交时使用 `--no-submit`。`--prepare-download`
+保留给显式的登录节点准备-only 运行。`--retry-existing` 会有意重置不完整 controller
+状态，普通断线重连不要使用。`--allow-compute-download` 只用于调试，不属于正常的
+Ozstar 网络架构。
+
+每次进程启动时读取以下可修改设置。默认值是当前运行默认值，不是密码或其他 secret：
+
+| 类别 | 设置 | 默认值和含义 |
+|---|---|---|
+| 范围 | `--begin`、`--end` | 包含端点的 UCS 范围，推荐的单次运行控制项。 |
+| 范围 | `ASKAP_UCS_START`、`ASKAP_UCS_END` | 未提供 CLI 范围时使用，默认 `1`、`1000`。 |
+| 持久化路径 | `ASKAP_WORK` | `/fred/oz299/qhuang/ASKAP-UCDs`，包含 staging、products、state、logs。 |
+| 输入路径 | `ASKAP_CATALOGUE`、`ASKAP_TIME_CSV` | 覆盖 catalogue 和旧 `obs_id` 到 `t_min` CSV 的路径。 |
+| 内存 | `ASKAP_SBATCH_MEM` | `80G`，Slurm worker 内存；需要时每次运行前调整。 |
+| scratch | `ASKAP_SBATCH_TMP` | `10G`，仅是小型 Slurm scratch，不存放 MS/产物。 |
+| 分区 | `ASKAP_SBATCH_PARTITION` | 默认空；需要时设置站点批准的 Slurm partition。 |
+| block/storage | `BLOCK_SIZE` | 固定的每 block 最多 50 个 UCS 编号，不能作为运行时覆盖值。 |
+| block/storage | `ASKAP_STAGING_BUDGET_BYTES` | `2 * 1024**4`，估计 staging 准入上限。 |
+| CASDA 筛选 | `ASKAP_CASDA_MAX_FILE_SIZE_KB` | 每行 archive 估计大小的过滤上限。 |
+| CASDA 批量 | `ASKAP_CASDA_STAGE_BATCH_SIZE`、`ASKAP_CASDA_QUERY_LIMIT` | CASDA staging 批量 `20`、TAP 行数上限 `5000`。 |
+| 下载重试 | `ASKAP_CASDA_SOURCE_DOWNLOAD_RETRIES`、`ASKAP_CASDA_SOURCE_RETRY_DELAY_SECONDS` | 每个源默认重试 `3` 次、间隔 `30` 秒；仍失败则记录 `download_failed` 并继续下一个源。 |
+| 时间估计 | `ASKAP_HOURS_PER_OBS` | 每个 observation `3.0` 小时，用于 packing 和 worker wave 判断。 |
+| 时间估计 | `ASKAP_SOURCE_OVERHEAD_HOURS` | controller 估计中每源 `0.5` 小时。 |
+| Slurm 时间 | `ASKAP_JOB_WALLTIME_HOURS` | 生成 worker 的 `48` 小时，不是完成条件。 |
+| 墙钟安全 | `ASKAP_WALLTIME_RESERVE_MINUTES` | partial 退出前保留 `20` 分钟。 |
+| CPU | `ASKAP_PARALLEL_SLOTS` | `4` 个并发 SB wave。 |
+| CPU | `ASKAP_CPU_PER_SLOT` | 每个 DStools 进程 `8` 线程；默认总计 `4 x 8 = 32` CPU，不能超过 32。 |
+| CPU | `ASKAP_CREATE_MODEL_THREADS` | 默认等于 `ASKAP_CPU_PER_SLOT`，DStools model 线程数。 |
+| controller | `ASKAP_CONTROLLER_INITIAL_DELAY_SECONDS`、`ASKAP_CONTROLLER_POLL_INTERVAL_SECONDS` | `30` 秒和 `60` 秒，只影响文件系统轮询；也有 CLI 选项。 |
+| 自动重提交 | `ASKAP_MAX_AUTO_RESUBMITS` | partial worker 后自动 self-resubmit 的次数，默认 `20`。 |
+| Python/module | `ASKAP_PYTHON_BIN`、`ASKAP_PYTHON_PARENT_MODULE`、`ASKAP_PYTHON_MODULE` | 生成 worker 使用的主机解释器和 module。 |
+| 容器 | `DSTOOLS_CONTAINER`、`APPTAINER_BIN` | DStools 镜像和 Apptainer 可执行文件。 |
+
+如果确实需要科学参数变化，也可以设置 `ASKAP_DSTOOLS_BAND`、
+`ASKAP_CREATE_MODEL_ITERATIONS`、`ASKAP_MIN_UV_METRES`、
+`ASKAP_EXTRACT_MIN_UV_METRES`、`ASKAP_CROP_ARCMIN`、
+`ASKAP_SPTNUM_THRESHOLD`、`ASKAP_DEFAULT_T_MIN` 和 `ASKAP_MJD_J2000`。
+fallback `ASKAP_DEFAULT_T_MIN` 是 MJD `61041.5`（2026-01-01 12:00 UTC）。
+`ASKAP_SAFETY_FACTOR`、`ASKAP_TARGET_OBS`、`ASKAP_MAX_SOURCES_PER_JOB` 和
+`ASKAP_SCAN_WINDOW` 是为兼容旧 packing 设置而保留的；当前 controller 使用固定的
+50-UCS 上限和实时 staging/剩余空间检查，不使用这些旧参数改变 block。
+
+凭据和连接环境：
+
+| 用途 | 设置 |
+|---|---|
+| CASDA 登录 | `CASDA_USERNAME`、`CASDA_PASSWORD_FILE`、当前进程的 `CASDA_PASSWORD` |
+| Ozstar 到 ada | `ADA_SSH_USER`、`ADA_SSH_HOST`、`ADA_VISIBILITY_ROOT`、`ADA_PASSWORD_FILE` |
+| ada 到 Ozstar | `OZSTAR_SSH_USER`、`OZSTAR_SSH_HOST`、`OZSTAR_PRODUCT_ROOT`、`OZSTAR_PASSWORD_FILE` |
+| 传输密码/工具 | `TRANSFER_PASSWORD_FILE`、当前进程的 `TRANSFER_PASSWORD`、`SSHPASS_BIN`、`ASKAP_SSH_CONNECT_TIMEOUT` |
+
+默认使用受保护的密码文件。环境密码只应作为短期覆盖值，不能放入 shell history、
+README、manifest 或日志。wrapper 不会自动传输。
+
+## 3. Post-Run Checks and Transfer to ada / 运行后检查和传输到 ada
+
+### English
+
+Before transferring, confirm the controller JSON at
+`state/controllers/UCS<begin>-<end>.json` is `complete`. Check source state
+files in `state/sources/` and inspect `logs/` and the generated Slurm output for
+failures. A block is not complete merely because a Slurm job exited: every
+source must be terminal, and every complete source must pass product and
+staging-residue validation.
+
+The ada-compatible product tree is:
 
 ```text
 products/UCS1501-1550/UCSXXXX/LongObs/SBXXXXX_beamYY/
@@ -556,97 +375,219 @@ products/UCS1501-1550/UCSXXXX/LongObs/SBXXXXX_beamYY/
         wsclean-MFS-V-image.fits
 ```
 
-成功完成的源会从 `staging/` 删除原始 MS，只保留上述最终产品。
-
-## 中文 10：传输到 HPC-ada
-
-在 Ozstar 上，先进行 dry-run：
+The transfer is always explicit and starts from the Ozstar side:
 
 ```bash
 cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
-./transfer_to_ada.sh \
-  --batch UCS1501-1550 \
-  --dry-run
+./transfer_to_ada.sh --batch UCS1501-1550 --dry-run
+./transfer_to_ada.sh --batch UCS1501-1550
 ```
 
-确认无误后正式传输：
+The wrapper transfers only `.ds` files and the MFS Stokes-I/V FITS files, then
+compares the local and remote SHA-256 inventories. Use `--method rsync` for a
+large or interrupted transfer. `--delete-source` is never implicit and should
+be used only after the remote inventory matches and all local source states are
+`complete`:
 
 ```bash
-./transfer_to_ada.sh \
-  --batch UCS1501-1550
+./transfer_to_ada.sh --batch UCS1501-1550 --method rsync --delete-source
 ```
 
-默认目标目录为：
+The transfer password is read from a mode-600 file on the machine initiating
+the transfer, or from one-process `TRANSFER_PASSWORD`. Password values are not
+embedded in source, arguments, manifests, or output. The reverse wrapper
+`transfer_to_ozstar.sh` is available for an explicit ada-to-Ozstar transfer;
+its deletion safeguard requires a separate deliberate option.
+
+### 中文
+
+传输前确认 `state/controllers/UCS<begin>-<end>.json` 的状态为 `complete`。检查
+`state/sources/` 中的源状态文件，并查看 `logs/` 和生成的 Slurm 输出是否有失败。
+不能仅凭 Slurm job 退出就认为 block 完成：每个源都必须处于终态，而且 `complete`
+源必须通过产物和 staging 残留检查。
+
+ada-compatible 产物目录如下：
 
 ```text
-/import/ada1/qhua0119/Visibility/UCS1501-1550/
+products/UCS1501-1550/UCSXXXX/LongObs/SBXXXXX_beamYY/
+    SBXXXXX_beamYY.ds
+    wsclean_model/
+        wsclean-MFS-I-image.fits
+        wsclean-MFS-V-image.fits
 ```
 
-程序只传输 `.ds`、`wsclean-MFS-I-image.fits` 和
-`wsclean-MFS-V-image.fits`，并比较本地与远端的相对路径和 SHA-256 digest。
-
-在所有需要的数据都确认传输完成前，不要使用：
+传输必须显式执行，并从 Ozstar 侧开始：
 
 ```bash
---delete-source
+cd /fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap
+./transfer_to_ada.sh --batch UCS1501-1550 --dry-run
+./transfer_to_ada.sh --batch UCS1501-1550
 ```
 
-Ozstar → ada 删除源文件时，程序还会检查对应 source state 是否为 `complete`。
-
-## 中文 11：反向传输
-
-如果需要把 ada 上已有的 ada-compatible 数据树传回 Ozstar，在 ada 上运行：
+wrapper 只传输 `.ds` 和 MFS Stokes-I/V FITS，然后比较本地与远端的 SHA-256 清单。
+大型或中断后的传输可使用 `--method rsync`。`--delete-source` 永远不是隐含行为，
+只有在远端清单匹配且所有本地源状态都是 `complete` 后才使用：
 
 ```bash
-python3 transfer_products.py \
-  --direction to-ozstar \
-  --source-root /import/ada1/qhua0119/Visibility \
-  --batch UCS1501-1550
+./transfer_to_ada.sh --batch UCS1501-1550 --method rsync --delete-source
 ```
 
-默认目标为：
+传输密码从发起传输的机器上的 mode-600 文件读取，或使用当前进程的
+`TRANSFER_PASSWORD`。密码值不会写入源码、参数、manifest 或输出。
+`transfer_to_ozstar.sh` 可用于显式的 ada-to-Ozstar 反向传输；反向删除也需要另外的
+明确选项和人工确认。
+
+## 4. Architecture and Runtime Summary / 架构和运行时总结
+
+### English
 
 ```text
-/fred/oz299/qhuang/ASKAP-UCDs/products/
+Ozstar login node
+  catalogue -> CASDA TAP filter/deduplicate -> full-row ECSV cache
+  CASDA login -> download tar/tar.gz/tgz + .checksum only
+  filesystem-state controller -> prepare one block -> submit/poll
+                                |
+                                v
+Ozstar compute node
+  extract only the current source's archives -> DStools -> crop FITS
+  atomic products/checkpoints -> source state -> partial self-resubmit if needed
+                                |
+                                v
+Ozstar persistent products -> explicit SHA-256-verified transfer -> ada
 ```
 
-## 中文 12：在 ada 上绘图
+The confirmed runtime boundaries are:
 
-传输完成后，确认 ada 上存在：
+- CASDA TAP, CASDA login, and archive download run on the login node.
+- The login node never extracts a CASDA archive.
+- A compute worker extracts only the current source's already-downloaded
+  archives and runs DStools. Compute-node CASDA download is disabled by default
+  and exists only behind `--allow-compute-download` for debugging.
+- A block has at most 50 UCS numbers. Its 2 TB staging admission estimate is
+  the sum of filtered, release-checked, nearest-row-deduplicated CASDA
+  `access_estsize` values, interpreted as KB and converted to bytes. Existing
+  staging usage and actual persistent free space are also enforced.
+- Full filtered TAP rows are preserved in ECSV. If CASDA returns `t_min` or
+  `t_max`, those columns remain available to the worker.
+- Proper-motion `t_min` precedence is CASDA ECSV first, legacy `obs_id -> t_min`
+  CSV second, and fallback MJD `61041.5` third.
+- The controller is filesystem-state driven. It does not use `squeue` or
+  `sacct` as a completion source. A partial worker writes checkpoints and the
+  generated sbatch script automatically resubmits itself within the configured
+  limit.
+- The current resource model is 3 hours per observation, four concurrent slots
+  of eight CPU threads (`4 x 8`), 80G Slurm memory, a 48-hour generated walltime
+  default, a 20-minute worker reserve, and a compact Slurm job name.
+- Transfer to ada is explicit, password-safe, and verified. Processing never
+  starts an automatic transfer.
+- Shell setup loads modules but performs no `module purge` and no
+  `module unload`.
+
+Persistent state and products are organized as follows:
 
 ```text
-/import/ada1/qhua0119/Visibility/UCS1501-1550/
+${ASKAP_WORK}/
+  catalogue/                  input CSV files
+  staging/                    archives and current-source MS trees
+  products/                   ada-compatible DS/FITS products
+  state/controllers/          range-level controller state
+  state/jobs/                 block manifests and generated sbatch scripts
+  state/sources/               per-source state and checkpoints
+  state/tap_cache/             full filtered ECSV rows
+  logs/                       worker, SB, and transfer-related logs
 ```
 
-修改 ada 原来的 `Main_SpecType.py`：
+The program files are intentionally small roles: `ozstar_main.py` controls
+planning/submission/polling; `casda_query.py` performs TAP filtering, keyring
+login, and safe archive downloads; `prepare_download.py` performs login-node
+preparation; `staging.py` safely extracts on compute nodes;
+`process_job.py` runs DStools and checkpoints; `pipeline_utils.py` validates
+state/products; `crop_fits.py` preserves useful celestial WCS while cropping;
+and `transfer_products.py` performs explicit verified transfer.
 
-```python
-Batch_Begins = [1501]
-Number = 50
-
-STEPS = {
-    "download_visibility": False,
-    "decompress_move": False,
-    "dstool_process": False,
-    "plot_images": True,
-    "combine_images": True,
-}
-```
-
-然后运行原来的 ada 主程序。第 4 步会生成 DS、Cutout 和 Contour 图，第 5 步
-会进行最终图像拼接。10′ FITS 足够支持原程序需要的 1′、3′ 和 60″ 图像。
-
-## 中文 13：状态、日志和断点恢复
-
-状态文件位置：
+### 中文
 
 ```text
-state/tap_cache/       TAP 查询结果
-state/sources/         每个源的状态和 SB checkpoint
-state/jobs/            manifest 和生成的 sbatch 脚本
-logs/                  Slurm 日志和每个 SB 的 DStools 日志
+Ozstar 登录节点
+  catalogue -> CASDA TAP 筛选/去重 -> 完整行 ECSV cache
+  CASDA 登录 -> 只下载 tar/tar.gz/tgz + .checksum
+  文件系统状态 controller -> 准备一个 block -> 提交/轮询
+                              |
+                              v
+Ozstar 计算节点
+  只解压当前源的 archive -> DStools -> FITS 裁剪
+  原子产物/checkpoint -> 源状态 -> 必要时 partial 自动 self-resubmit
+                              |
+                              v
+Ozstar 持久化产物 -> 显式 SHA-256 校验传输 -> ada
 ```
 
-一个 SB 只有在有效 `.ds` 和 Stokes-I FITS 都存在时才会被视为完成。失败的 SB
-会留在 `staging/`，下一次提交时继续处理。任务达到墙钟保护后会退出为
-`partial`，下一次使用相同编号范围即可恢复。
+已确认的运行边界如下：
+
+- CASDA TAP、CASDA 登录和 archive 下载在登录节点执行。
+- 登录节点不解压 CASDA archive。
+- 计算 worker 只解压当前源已经下载的 archive，并运行 DStools。默认禁止计算节点
+  下载 CASDA；只有调试选项 `--allow-compute-download` 才会启用该路径。
+- 每个 block 最多 50 个 UCS 编号。2 TB staging 准入估计是经过筛选、release 检查、
+  按最近行去重后的 CASDA `access_estsize` 之和，单位按 KB 解释后转换成 bytes；同时
+  强制检查已有 staging 占用和持久化文件系统实际剩余空间。
+- 过滤后的 TAP 完整行保存为 ECSV。如果 CASDA 返回 `t_min` 或 `t_max`，这些列会保留
+  并提供给 worker。
+- 自行修正的 `t_min` 优先级是 CASDA ECSV，其次是旧的 `obs_id -> t_min` CSV，最后是
+  fallback MJD `61041.5`。
+- controller 由文件系统状态驱动，不用 `squeue` 或 `sacct` 作为完成依据。partial worker
+  写入 checkpoint，生成的 sbatch 会在配置次数内自动 self-resubmit。
+- 当前资源模型是每个 observation 3 小时、4 个并发 slot、每 slot 8 个 CPU 线程
+  （`4 x 8`）、80G Slurm 内存、默认 48 小时生成 walltime、20 分钟 worker reserve，
+  以及短 Slurm 名称。
+- 到 ada 的传输必须显式执行、密码安全并校验。处理命令不会自动传输。
+- shell setup 只加载 module，不执行 `module purge` 或 `module unload`。
+
+持久化状态和产物目录如下：
+
+```text
+${ASKAP_WORK}/
+  catalogue/                  输入 CSV
+  staging/                    archive 和当前源 MS 树
+  products/                   ada-compatible DS/FITS 产物
+  state/controllers/          范围级 controller 状态
+  state/jobs/                 block manifest 和生成的 sbatch
+  state/sources/              每源状态和 checkpoint
+  state/tap_cache/            完整过滤后 ECSV 行
+  logs/                       worker、SB 和传输相关日志
+```
+
+程序文件职责保持单一：`ozstar_main.py` 负责规划、提交和轮询；`casda_query.py` 负责
+TAP 筛选、keyring 登录和安全 archive 下载；`prepare_download.py` 负责登录节点准备；
+`staging.py` 负责计算节点安全解压；`process_job.py` 运行 DStools 并写 checkpoint；
+`pipeline_utils.py` 验证状态和产物；`crop_fits.py` 保留有效天球 WCS 并裁剪；
+`transfer_products.py` 执行显式且经过验证的传输。
+
+## Diagnostic: Legacy CASDA Download Comparison / 诊断：旧 CASDA 下载路径对比
+
+`casda_remote_compare.py` is not part of production processing. It reproduces
+the legacy `Download_ASKAP_Visibility_Remote.py` path with the same target
+coordinates, `t_exptime > 100` query, release filter, `stage_data`, and
+`Casda.download_files`. Run it in the legacy/local `astro` environment when a
+Pawsey 403 needs comparison:
+
+```bash
+python casda_remote_compare.py --limit 1
+python casda_remote_compare.py --obs-id 50508 --limit 1
+python casda_remote_compare.py --obs-id 64751 --filename-contains VAST_1147+06 --limit 1
+```
+
+Use `--limit 40` only for an intentional full legacy-batch test. Never publish
+the complete staged URLs because they contain temporary access signatures.
+
+`casda_remote_compare.py` 不是生产处理程序。它使用与旧
+`Download_ASKAP_Visibility_Remote.py` 相同的坐标、`t_exptime > 100` 查询、release
+filter、`stage_data` 和 `Casda.download_files`，用于对比 Pawsey 403：
+
+```bash
+python casda_remote_compare.py --limit 1
+python casda_remote_compare.py --obs-id 50508 --limit 1
+```
+
+只有在确实需要整批旧流程测试时才使用 `--limit 40`。不要公开完整 staged URL，
+因为其中包含临时访问签名。

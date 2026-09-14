@@ -1,4 +1,10 @@
-"""Crop WSClean FITS images while preserving the useful celestial WCS."""
+"""Crop WSClean FITS images while preserving useful celestial WCS.
+
+English: The image is cropped around the proper-motion-corrected ICRS
+position, written through a temporary file, and atomically replaced.
+
+中文：图像围绕经过自行修正的 ICRS 位置裁剪，先写入临时文件，再原子替换原文件。
+"""
 
 from __future__ import annotations
 
@@ -29,6 +35,11 @@ _COPY_HEADER_KEYS = (
 
 
 def _as_2d(data: np.ndarray) -> np.ndarray:
+    """Reduce a FITS array to its first 2-D image plane.
+
+    中文：把 FITS 数组取到第一个 2-D 图像平面。
+    """
+
     data = np.asarray(data)
     while data.ndim > 2:
         data = data[0]
@@ -38,7 +49,13 @@ def _as_2d(data: np.ndarray) -> np.ndarray:
 
 
 def crop_fits(path: Path, ra_deg: float, dec_deg: float, size_arcmin: float) -> None:
-    """Crop one image in place around the proper-motion-corrected position."""
+    """Crop one image in place around the proper-motion-corrected position.
+
+    English: Preserve useful observation/header metadata while replacing the
+    celestial WCS with the cutout WCS.
+
+    中文：保留有用的观测/header 元数据，并用 cutout 的天球 WCS 替换原 WCS。
+    """
 
     path = Path(path)
     with fits.open(path, memmap=False) as hdul:
@@ -71,6 +88,11 @@ def crop_fits(path: Path, ra_deg: float, dec_deg: float, size_arcmin: float) -> 
 
 
 def main() -> None:
+    """Crop one FITS image from command-line coordinates and size.
+
+    中文：根据命令行坐标和尺寸裁剪一个 FITS 图像。
+    """
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("fits", type=Path)
     parser.add_argument("ra", type=float)

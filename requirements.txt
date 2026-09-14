@@ -3,3 +3,4 @@ pandas
 astropy
 h5py
 astroquery
+keyring
