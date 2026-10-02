@@ -1,0 +1,19 @@
+
+# Local caches, environments, credentials and runtime outputs
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+my-environment/
+.env
+.env.local
+casda-password
+transfer-password
+ozstar-transfer-password
+staging/
+products/
+logs/
+state/
+*.sif
+*.ms/
+*.ms.tar*
