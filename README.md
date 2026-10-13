@@ -1,45 +1,34 @@
 # Ozstar ASKAP UCD Pipeline
 
-ASKAP visibility processing on Ozstar, with product retrieval from HPC-ada.
+Process ASKAP visibility data on Ozstar and retrieve verified DS/Stokes-I/V
+products from HPC-ada. The pipeline uses a full-catalogue observation index
+and shared models; the default radius uses central frequency.
 
-## Repository layout
+## English documentation
 
-- `ozstar_askap/`: current processing pipeline, deployment scripts,
-  validation programs, retry handling and product transfer tools.
-- `New_dstools_build/`: DStools SIF build recipes, version configuration
-  and compatibility patches.
-- `Download_ASKAP_Visibility_Remote.py`: standalone downloader for
-  manually testing a single sky position.
+1. [Installation](docs/en/INSTALLATION.md) — prerequisites, deployment, Python, SIF and credentials.
+2. [Usage](docs/en/USAGE.md) — minimal commands, optional parameters, indexing, processing, retries and Ada retrieval.
+3. [How it works](docs/en/REFERENCE.md) — selection, model isolation, scheduling, recovery, state and cleanup.
+4. [SIF build (optional)](docs/en/SIF_BUILD.md) — rebuild the container only when needed.
 
-## Documentation
+Repository layout: `ozstar_askap/` contains the pipeline and transfer tools;
+`New_dstools_build/` contains the offline SIF recipe and patches;
+`Download_ASKAP_Visibility_Remote.py` is the standalone single-position downloader.
+Deployment code and runtime data directories are configured separately. Do not
+commit passwords, MS/SIF files, products or runtime state. Historical validation
+material and regression code are retained, but are not part of the daily runbook.
 
-- [Pipeline instructions](ozstar_askap/README.md)
-- [Shared-observation processing and isolated validation](ozstar_askap/SHARED_PROCESSING.md)
-- [Gate8 central-frequency small-sample validation](ozstar_askap/GATE8_CENTRAL_VALIDATION.md)
-- [Gate9 shared-retry and controller-resume validation](ozstar_askap/GATE9_SHARED_RETRY_VALIDATION.md)
-- [Gate10 shared-product Ada pull validation](ozstar_askap/GATE10_SHARED_TRANSFER_VALIDATION.md)
-- [SIF build instructions](New_dstools_build/README.md)
+## 中文说明
 
-Run and deploy the pipeline from `ozstar_askap/`.
-SIF construction is only needed when building or updating the container.
+在 Ozstar 处理 ASKAP visibility 数据，由 HPC-ada 拉取并校验 DS/Stokes-I/V
+产物。程序使用全表观测索引与共享模型，交叉匹配半径默认按中心频率计算。
 
-Local observation-table downloads, review and comparisons belong under
-`/Users/qhua0119/Documents/ChatGPT/Ozstar/观测记录表格/` (including dated subdirectories).
-This local review location does not change the Ozstar pipeline's runtime index paths.
+1. [安装](docs/zh-CN/INSTALLATION.md) — 环境要求、部署、Python、SIF 与凭据。
+2. [使用](docs/zh-CN/USAGE.md) — 最简指令、可选参数、索引、处理、重试和 Ada 拉取。
+3. [运行机制](docs/zh-CN/REFERENCE.md) — 筛选、模型隔离、调度、恢复、状态和清理。
+4. [SIF 构建（可选）](docs/zh-CN/SIF_BUILD.md) — 仅在需要时重建容器。
 
-## Baseline
-
-The new default controller includes full-catalogue observation indexing,
-frequency-dependent cross-matching and shared-model processing. The
-default radius uses the arithmetic central frequency; retain
-`--radius-frequency-mode top` or `central` for per-run overrides. Historical
-top indexes stay identified as top and are not silently reused as central.
-Concurrency defaults to four observation slots (eight CPUs each), with a configurable
-`--parallel-slots` switch and a 48-hour walltime cap; requests use slot estimates.
-Default Slurm memory is 160G total (40G per slot with four slots).
-Its local regression suite uses simulated CASDA/Slurm/DStools calls; a real isolated
-Ozstar validation is still required before production deployment.
-
-The tag `pre-shared-model-20261002` preserves the original
-pre-refactor backup. Older root-level pipeline files remain
-recoverable from Git history.
+仓库结构：`ozstar_askap/` 包含处理程序与传输工具；`New_dstools_build/` 包含
+离线 SIF 构建配方与补丁；`Download_ASKAP_Visibility_Remote.py` 用于单个坐标的
+独立下载。程序部署目录与运行数据目录分别配置。不要提交密码、MS/SIF、产物或
+运行状态。历史验证资料和回归代码继续保留，但不属于日常操作手册。
