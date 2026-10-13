@@ -58,11 +58,18 @@ UCS_END = int(os.environ.get("ASKAP_UCS_END", "1000"))
 
 # Batch packing and resource controls.
 # block packing 和资源控制项。
-HOURS_PER_OBS = float(os.environ.get("ASKAP_HOURS_PER_OBS", "3.0"))
-SOURCE_OVERHEAD_HOURS = float(os.environ.get("ASKAP_SOURCE_OVERHEAD_HOURS", "0.5"))
+HOURS_PER_OBS = float(os.environ.get("ASKAP_HOURS_PER_OBS", "2.0"))
+SOURCE_OVERHEAD_HOURS = float(os.environ.get("ASKAP_SOURCE_OVERHEAD_HOURS", "2.0"))
 PARALLEL_SLOTS = int(os.environ.get("ASKAP_PARALLEL_SLOTS", "4"))
 CPU_PER_SLOT = int(os.environ.get("ASKAP_CPU_PER_SLOT", "8"))
 JOB_WALLTIME_HOURS = float(os.environ.get("ASKAP_JOB_WALLTIME_HOURS", "48"))
+# One compute submission owns one UCS source.  Large sources are resumed in
+# chunks. Shared jobs pack independent observation groups into CPU slots;
+# the default 48-hour cap is an upper bound, not a fixed Slurm request.
+MAX_MS_PER_JOB = int(os.environ.get("ASKAP_MAX_MS_PER_JOB", "40"))
+MAX_JOB_WALLTIME_HOURS = float(
+    os.environ.get("ASKAP_MAX_JOB_WALLTIME_HOURS", "48")
+)
 SAFETY_FACTOR = float(os.environ.get("ASKAP_SAFETY_FACTOR", "0.85"))
 TARGET_OBS = int(os.environ.get("ASKAP_TARGET_OBS", "40"))
 MAX_SOURCES_PER_JOB = int(os.environ.get("ASKAP_MAX_SOURCES_PER_JOB", "20"))
@@ -87,6 +94,9 @@ CONTROLLER_INITIAL_DELAY_SECONDS = float(
 CONTROLLER_POLL_INTERVAL_SECONDS = float(
     os.environ.get("ASKAP_CONTROLLER_POLL_INTERVAL_SECONDS", "60")
 )
+CONTROLLER_HEARTBEAT_TIMEOUT_SECONDS = float(
+    os.environ.get("ASKAP_CONTROLLER_HEARTBEAT_TIMEOUT_SECONDS", str(2 * 3600))
+)
 MAX_AUTO_RESUBMITS = int(os.environ.get("ASKAP_MAX_AUTO_RESUBMITS", "20"))
 PARTIAL_EXIT_CODE = int(os.environ.get("ASKAP_PARTIAL_EXIT_CODE", "75"))
 
@@ -94,17 +104,26 @@ PARTIAL_EXIT_CODE = int(os.environ.get("ASKAP_PARTIAL_EXIT_CODE", "75"))
 # ASKAP/DStools 处理设置；这些设置与原 ada 流程保持一致。
 CONTAINER = _path_from_env(
     "DSTOOLS_CONTAINER",
-    Path("/fred/oz299/qhuang/dstools/dstools-v2.0.0.sif"),
+    Path("/fred/oz299/qhuang/dstools/dstools-260925.sif"),
 )
 APPTAINER_BIN = os.environ.get("APPTAINER_BIN", "apptainer")
+APPTAINER_BIND = os.environ.get(
+    "ASKAP_APPTAINER_BIND",
+    "/fred/oz299/qhuang:/fred/oz299/qhuang",
+)
 BAND = os.environ.get("ASKAP_DSTOOLS_BAND", "AK_low")
+# DStools create-model defaults requested for the ASKAP production run.
+# ASKAP 生产运行要求的 DStools create-model 默认参数。
 CREATE_MODEL_ITERATIONS = int(
-    os.environ.get("ASKAP_CREATE_MODEL_ITERATIONS", "50000")
+    os.environ.get("ASKAP_CREATE_MODEL_ITERATIONS", "100000")
 )
 CREATE_MODEL_THREADS = int(
     os.environ.get("ASKAP_CREATE_MODEL_THREADS", str(CPU_PER_SLOT))
 )
-MIN_UV_METRES = float(os.environ.get("ASKAP_MIN_UV_METRES", "0"))
+MIN_UV_METRES = float(os.environ.get("ASKAP_MIN_UV_METRES", "200"))
+CREATE_MODEL_MULTISCALE = os.environ.get(
+    "ASKAP_CREATE_MODEL_MULTISCALE", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 EXTRACT_MIN_UV_METRES = float(
     os.environ.get("ASKAP_EXTRACT_MIN_UV_METRES", "500")
 )
@@ -120,6 +139,29 @@ CASDA_MAX_FILE_SIZE_KB = float(
 )
 CASDA_STAGE_BATCH_SIZE = int(os.environ.get("ASKAP_CASDA_STAGE_BATCH_SIZE", "20"))
 CASDA_QUERY_LIMIT = int(os.environ.get("ASKAP_CASDA_QUERY_LIMIT", "5000"))
+# Full-catalogue queries run sequentially on the login node. Shared workers
+# own independent observations in parallel; each observation's targets are serial.
+CROSSCATALOGUE_QUERY_DELAY_SECONDS = float(os.environ.get("ASKAP_CROSSCATALOGUE_QUERY_DELAY_SECONDS", "0.2"))
+SHARED_TARGET_HOURS = float(os.environ.get("ASKAP_SHARED_TARGET_HOURS", "0.5"))
+# The TAP query first gathers a conservative one-degree neighbourhood.  Each
+# returned row is then filtered against the half-power radius at that row's
+# arithmetic central frequency by default; top remains available as an override.
+# ObsCore em_min/em_max are vacuum wavelength bounds in metres:
+# central = (c/em_min + c/em_max)/2, top = c/em_min.
+# TAP 先查询一度范围，默认按频率上下限的算术平均值筛选；保留 top 选项。
+CASDA_INITIAL_QUERY_RADIUS_DEG = float(
+    os.environ.get("ASKAP_CASDA_INITIAL_QUERY_RADIUS_DEG", "1.0")
+)
+CASDA_REFERENCE_FWHM_DEG = float(
+    os.environ.get("ASKAP_CASDA_REFERENCE_FWHM_DEG", "1.2")
+)
+CASDA_REFERENCE_FREQUENCY_GHZ = float(
+    os.environ.get("ASKAP_CASDA_REFERENCE_FREQUENCY_GHZ", "1.4")
+)
+# CLI --radius-frequency-mode takes precedence over this environment setting.
+CASDA_RADIUS_FREQUENCY_MODE = os.environ.get(
+    "ASKAP_CASDA_RADIUS_FREQUENCY_MODE", "central"
+).strip().lower()
 CASDA_SOURCE_DOWNLOAD_RETRIES = int(
     os.environ.get("ASKAP_CASDA_SOURCE_DOWNLOAD_RETRIES", "3")
 )
@@ -131,7 +173,7 @@ CASDA_SOURCE_RETRY_DELAY_SECONDS = float(
 # WSClean products, checkpoints, and logs.
 # Slurm 设置。--tmp 只是小型 scratch；持久化 WORK 保存 MS、WSClean 产物、checkpoint
 # 和日志。
-SBATCH_MEM = os.environ.get("ASKAP_SBATCH_MEM", "80G")
+SBATCH_MEM = os.environ.get("ASKAP_SBATCH_MEM", "160G")
 SBATCH_TMP = os.environ.get("ASKAP_SBATCH_TMP", "10G")
 SBATCH_PARTITION = os.environ.get("ASKAP_SBATCH_PARTITION", "")
 PYTHON_BIN = os.environ.get("ASKAP_PYTHON_BIN", "python3")
@@ -158,7 +200,8 @@ CASDA_PASSWORD_ENV = "CASDA_PASSWORD"
 ADA_SSH_USER = os.environ.get("ADA_SSH_USER", "qhua0119")
 ADA_SSH_HOST = os.environ.get("ADA_SSH_HOST", "ada.physics.usyd.edu.au")
 ADA_VISIBILITY_ROOT = os.environ.get(
-    "ADA_VISIBILITY_ROOT", "/import/ada1/qhua0119/Visibility"
+    "ADA_VISIBILITY_ROOT",
+    "/import/ada1/qhua0119/Combine_ImagePlot/Ozstar/products",
 )
 OZSTAR_SSH_USER = os.environ.get("OZSTAR_SSH_USER", "qhuang")
 OZSTAR_SSH_HOST = os.environ.get("OZSTAR_SSH_HOST", "ozstar.swin.edu.au")
@@ -200,10 +243,16 @@ def ensure_directories() -> None:
     中文：在运行开始前同时检查 Ozstar 的 32 CPU worker 上限。
     """
 
+    if PARALLEL_SLOTS < 1 or CPU_PER_SLOT < 1:
+        raise ValueError("PARALLEL_SLOTS and CPU_PER_SLOT must be positive")
     if PARALLEL_SLOTS * CPU_PER_SLOT > 32:
         raise ValueError(
             "PARALLEL_SLOTS * CPU_PER_SLOT must not exceed Ozstar's 32 CPU limit"
         )
+    if MAX_MS_PER_JOB < 1:
+        raise ValueError("MAX_MS_PER_JOB must be at least one")
+    if MAX_JOB_WALLTIME_HOURS <= 0 or JOB_WALLTIME_HOURS <= 0:
+        raise ValueError("Configured Slurm walltime values must be positive")
 
     for path in (
         WORK,

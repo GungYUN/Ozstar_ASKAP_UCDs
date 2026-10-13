@@ -1,4 +1,4 @@
-"""Password-assisted SCP/rsync transfer for ASKAP products.
+"""Legacy/reverse password-assisted transfer for ASKAP products.
 
 English: Password values are deliberately absent from source code and command
 arguments. Use a mode-600 password file (recommended) or set
@@ -10,14 +10,10 @@ verified; deletion is guarded and never automatic.
 进程设置 `TRANSFER_PASSWORD`。`sshpass` 非交互地把密码提供给 ssh/scp。传输必须
 显式执行，只传产物并进行 SHA-256 校验；删除受保护且永远不会自动发生。
 
-Examples, when this directory is installed at
-``/fred/oz299/qhuang/ASKAP-UCDs/ozstar_askap`` on Ozstar::
-
-    python3 transfer_products.py --direction to-ada --batch UCS1-50
-    python3 transfer_products.py --direction to-ada --dry-run
-
-The reverse direction is useful for moving a batch from ada back to the
-Ozstar product tree::
+Ozstar cannot connect to ada:22, so ``--direction to-ada`` is deliberately
+rejected.  Run ``pull_askap_products.py`` on ada for the supported product
+workflow.  This legacy module remains available only for explicit maintenance
+in the reverse direction::
 
     python3 transfer_products.py --direction to-ozstar --batch UCS1-50
 """
@@ -212,9 +208,9 @@ def _unexpected_local_files(batch_path: Path) -> list[Path]:
 
 
 def _validate_product_tree(batch_path: Path) -> None:
-    """Require every discovered SB directory to contain DS and Stokes-I.
+    """Require every discovered SB directory to contain DS and Stokes-I/V.
 
-    中文：要求发现的每个 SB 目录都包含 DS 和 Stokes-I 产物。
+    中文：要求发现的每个 SB 目录都包含 DS 和 Stokes-I/V 产物。
     """
 
     sb_dirs = sorted(
@@ -228,7 +224,8 @@ def _validate_product_tree(batch_path: Path) -> None:
     for sb_dir in sb_dirs:
         has_ds = any(sb_dir.glob("*.ds"))
         has_i = (sb_dir / "wsclean_model" / "wsclean-MFS-I-image.fits").exists()
-        if not (has_ds and has_i):
+        has_v = (sb_dir / "wsclean_model" / "wsclean-MFS-V-image.fits").exists()
+        if not (has_ds and has_i and has_v):
             incomplete.append(sb_dir.relative_to(batch_path).as_posix())
     if incomplete:
         raise RuntimeError(
@@ -355,6 +352,12 @@ def transfer(args: argparse.Namespace) -> None:
     中文：验证、传输、校验 batch，并在满足保护条件时可选删除；删除前后产物清单必须
     保持一致。
     """
+
+    if args.direction == "to-ada":
+        raise RuntimeError(
+            "Ozstar-to-ada push is disabled because ada:22 is unreachable from "
+            "Ozstar. Run pull_askap_products.py on an ada login node instead."
+        )
 
     default_source, default_user, default_host, default_remote_root, password_file = (
         _direction_defaults(args.direction)

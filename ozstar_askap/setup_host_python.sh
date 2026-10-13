@@ -23,16 +23,16 @@ if [[ ! -x "${ENV_PREFIX}/bin/python" ]]; then
   mkdir -p "${ROOT}/.venv"
   python -m venv --system-site-packages "${ENV_PREFIX}"
 elif ! "${ENV_PREFIX}/bin/python" -c \
-  'import astropy, astroquery, h5py, keyring, numpy, pandas' >/dev/null 2>&1; then
+  'import astropy, astroquery, keyring, numpy, pandas' >/dev/null 2>&1; then
   # pip below repairs an existing but incomplete environment.
   # 下面的 pip 会修复已存在但不完整的环境。
   true
 fi
 
 "${ENV_PREFIX}/bin/python" -m pip install --disable-pip-version-check \
-  --no-cache-dir numpy pandas astropy h5py astroquery keyring
+  --no-cache-dir numpy pandas astropy astroquery keyring
 "${ENV_PREFIX}/bin/python" -c \
-  'import astropy, astroquery, h5py, keyring, numpy, pandas; print("ASKAP host Python environment is ready")'
+  'import astropy, astroquery, keyring, numpy, pandas; print("ASKAP host Python environment is ready")'
 # Print the environment exports needed by the controller and generated worker.
 # 打印 controller 和生成 worker 所需的环境变量导出语句。
 printf 'Use this interpreter before planning jobs:\n'

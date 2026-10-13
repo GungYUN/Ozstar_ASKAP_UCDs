@@ -16,6 +16,7 @@ import argparse
 import json
 import logging
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ try:
         build_casda_client,
         download_source_table,
         estimated_access_bytes,
+        failed_download_sbs,
     )
     from .pipeline_utils import (
         atomic_write_json,
@@ -42,9 +44,22 @@ try:
         utc_now,
         write_source_state,
     )
+    from .sb_status import (
+        StateDatabaseError,
+        exhaust_retry_stage,
+        mark_redownload_ready,
+        prepare_explicit_retry,
+        record_source_failure,
+        retry_sb_names,
+    )
 except ImportError:  # Deployed-directory script mode / 部署目录直接脚本模式。
     import config
-    from casda_query import build_casda_client, download_source_table, estimated_access_bytes
+    from casda_query import (
+        build_casda_client,
+        download_source_table,
+        estimated_access_bytes,
+        failed_download_sbs,
+    )
     from pipeline_utils import (
         atomic_write_json,
         completed_product_sb_numbers,
@@ -56,6 +71,14 @@ except ImportError:  # Deployed-directory script mode / 部署目录直接脚本
         source_product_root,
         utc_now,
         write_source_state,
+    )
+    from sb_status import (
+        StateDatabaseError,
+        exhaust_retry_stage,
+        mark_redownload_ready,
+        prepare_explicit_retry,
+        record_source_failure,
+        retry_sb_names,
     )
 
 
@@ -74,6 +97,44 @@ def _download_retry_message(source_name: str, attempt: int, error: Exception) ->
         config.CASDA_SOURCE_DOWNLOAD_RETRIES,
         error,
     )
+
+
+def _purge_redownload_inputs(source_name: str, sb_ids: list[str]) -> None:
+    """Remove selected failed SB inputs before their one fresh CASDA fetch.
+
+    This login-node cleanup is intentionally repeated even if the compute
+    worker already removed the same paths.  It guarantees that a remaining MS,
+    tar, checksum, or source-wide completion marker cannot accidentally turn a
+    requested re-download into a stale-file resume.
+    """
+
+    longobs = config.STAGING_ROOT / source_name / "LongObs"
+    if not longobs.exists() or not sb_ids:
+        return
+    numbers = {
+        match.group(1)
+        for value in sb_ids
+        if (match := re.fullmatch(r"SB(\d+)", str(value), flags=re.IGNORECASE))
+    }
+    if not numbers:
+        return
+    patterns = [
+        re.compile(rf"SB{number}(?:\D|$)", flags=re.IGNORECASE)
+        for number in numbers
+    ]
+    for path in list(longobs.iterdir()):
+        if not any(pattern.search(path.name) for pattern in patterns):
+            continue
+        lower = path.name.lower()
+        if path.is_dir() and re.fullmatch(
+            r"SB\d+_beam\d+", path.name, flags=re.IGNORECASE
+        ):
+            shutil.rmtree(path)
+        elif path.is_file() and lower.endswith(
+            (".checksum", ".tar", ".tar.gz", ".tgz", ".part")
+        ):
+            path.unlink()
+    (longobs / ".download_complete.json").unlink(missing_ok=True)
 
 
 def _expected_numbers(source: dict[str, Any]) -> set[int]:
@@ -160,7 +221,9 @@ def _read_rows(source: dict[str, Any], expected: set[int]) -> Table:
 
 
 def _prepare_source_once(
-    source: dict[str, Any], manifest_path: Path | None = None
+    source: dict[str, Any],
+    manifest_path: Path | None = None,
+    attempt: int = 1,
 ) -> dict[str, Any]:
     """Download all required visibility archives for one manifest source.
 
@@ -171,6 +234,17 @@ def _prepare_source_once(
     """
 
     source_name = safe_source_name(str(source["source_name"]))
+    retry_plan = {"processing": [], "redownload": []}
+    if bool(source.get("retry_existing")):
+        retry_plan = prepare_explicit_retry(source_name)
+        _purge_redownload_inputs(source_name, retry_plan["redownload"])
+        if retry_plan["processing"] or retry_plan["redownload"]:
+            logger.info(
+                "%s: explicit retry prepared (processing=%s, redownload=%s)",
+                source_name,
+                ",".join(retry_plan["processing"]) or "none",
+                ",".join(retry_plan["redownload"]) or "none",
+            )
     expected = _expected_numbers(source)
     staging_longobs = config.STAGING_ROOT / source_name / "LongObs"
     product_longobs = source_product_root(int(source["ucs_number"]), source_name)
@@ -217,6 +291,7 @@ def _prepare_source_once(
                 rows[pending_mask],
                 staging_longobs,
                 source_name,
+                attempt=attempt,
             )
             logger.info(
                 "%s: login-node CASDA preparation downloaded %d URLs (%d failed)",
@@ -243,6 +318,15 @@ def _prepare_source_once(
             f"observations are absent: {', '.join(f'SB{number}' for number in sorted(missing))}. "
             "Retry preparation after inspecting the CASDA/download log."
         )
+
+    if bool(source.get("retry_existing")):
+        ready = mark_redownload_ready(source_name)
+        if ready:
+            logger.info(
+                "%s: fresh CASDA download completed for final processing retry: %s",
+                source_name,
+                ",".join(ready),
+            )
 
     staged_at = utc_now()
     write_source_state(
@@ -287,14 +371,16 @@ def prepare_source(
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
-            return _prepare_source_once(source, manifest_path)
+            return _prepare_source_once(source, manifest_path, attempt=attempt)
         except Exception as exc:
             last_error = exc
             _download_retry_message(source_name, attempt, exc)
             if attempt < retries and config.CASDA_SOURCE_RETRY_DELAY_SECONDS > 0:
                 time.sleep(config.CASDA_SOURCE_RETRY_DELAY_SECONDS)
+    failed_sbs = failed_download_sbs(source_name)
     raise SourceDownloadFailed(
-        f"{source_name}: download failed after {retries} attempts: {last_error}"
+        f"{source_name}: download failed after {retries} attempts; "
+        f"failed SBs={','.join(failed_sbs) or 'unknown'}: {last_error}"
     ) from last_error
 
 
@@ -352,12 +438,49 @@ def prepare_manifest(manifest_path: Path, allow_multiple: bool = False) -> dict[
             result = prepare_source(source, manifest_path)
         except SourceDownloadFailed as exc:
             failed_source_names.add(source_name)
-            write_source_state(source_name, status="download_failed", error=str(exc))
+            redownload_retry = retry_sb_names(
+                source_name, {"redownload_required"}
+            )
+            if redownload_retry:
+                exhausted = exhaust_retry_stage(
+                    source_name, "redownload_required"
+                )
+                logger.error(
+                    "%s: fresh download retry failed; retry exhausted for %s",
+                    source_name,
+                    ",".join(exhausted),
+                )
+            failed_sbs = failed_download_sbs(source_name)
+            write_source_state(
+                source_name,
+                status="complete_with_failures",
+                error=str(exc),
+                download_failed_sbs=failed_sbs,
+            )
             logger.error("%s: skipping after download retries: %s", source_name, exc)
             continue
+        except StateDatabaseError:
+            raise
         except Exception as exc:
-            write_source_state(source_name, status="stage_failed", error=str(exc))
-            raise RuntimeError(f"{source_name}: login-node preparation failed: {exc}") from exc
+            # A source-local staging failure is retained in the unified table
+            # and must not prevent later UCS sources from progressing.
+            failed_source_names.add(source_name)
+            redownload_retry = retry_sb_names(
+                source_name, {"redownload_required"}
+            )
+            if redownload_retry:
+                exhausted = exhaust_retry_stage(
+                    source_name, "redownload_required"
+                )
+                logger.error(
+                    "%s: fresh download preparation failed; retry exhausted for %s",
+                    source_name,
+                    ",".join(exhausted),
+                )
+            record_source_failure(source, str(exc), advance_retry=False)
+            write_source_state(source_name, status="complete_with_failures", error=str(exc))
+            logger.exception("%s: skipping after preparation failure", source_name)
+            continue
         source["stage_status"] = "staged"
         source["staged_at"] = result["staged_at"]
         prepared_sources.append(source)
@@ -373,8 +496,11 @@ def prepare_manifest(manifest_path: Path, allow_multiple: bool = False) -> dict[
     manifest["sources"] = prepared_sources
     for record in manifest.get("source_records", []):
         if record.get("source_name") in failed_source_names:
-            record["status"] = "download_failed"
-            record["reason"] = "download retries exhausted"
+            record["status"] = "complete_with_failures"
+            record["reason"] = "download/preparation failure; see sb_processing.sqlite"
+            record["download_failed_sbs"] = failed_download_sbs(
+                record["source_name"]
+            )
     manifest["download_failed_sources"] = sorted(failed_source_names)
     manifest["download_prepared_at"] = utc_now()
     manifest["download_prepared_on"] = "login"

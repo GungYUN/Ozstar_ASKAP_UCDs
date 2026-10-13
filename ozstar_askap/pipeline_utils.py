@@ -2,7 +2,7 @@
 
 English: These helpers provide atomic JSON state, persistent-size checks,
 source-safe paths, observation parsing, proper-motion epoch lookup, and final
-DS/FITS product validation.
+DS/FITS product filename checks.
 
 中文：这些 helper 提供原子 JSON 状态写入、持久化大小检查、安全源路径、观测编号解析、
 自行 epoch 查找，以及最终 DS/FITS 产物验证。
@@ -20,9 +20,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-
-import h5py
-from astropy.io import fits
+from urllib.parse import unquote
 
 try:
     from .config import PRODUCT_ROOT, STATE_ROOT, batch_name
@@ -120,6 +118,18 @@ def source_state_path(source_name: str) -> Path:
     return STATE_ROOT / "sources" / f"{safe_source_name(source_name)}.json"
 
 
+def download_state_path(source_name: str) -> Path:
+    """Return the per-source, per-SB download-state JSON path.
+
+    English: This is separate from the source controller state so one source
+    can retain individual SB download history and retry outcomes.
+
+    中文：该文件独立于源级 controller 状态，用于保留每个 SB 的下载历史和重试结果。
+    """
+
+    return STATE_ROOT / "sources" / f"{safe_source_name(source_name)}.downloads.json"
+
+
 def write_source_state(source_name: str, **values: Any) -> None:
     """Merge values into one source state and write it atomically.
 
@@ -168,6 +178,28 @@ def obs_number(value: Any) -> int | None:
         value = value.decode(errors="replace")
     match = re.search(r"(\d+)$", str(value))
     return int(match.group(1)) if match else None
+
+
+def sb_beam_from_name(name: str) -> tuple[str, str] | None:
+    """Read RACS SB...beamxx or HIPASS SBxxxxx_Fxx_Bxx basenames.
+
+    HIPASS Bxx is treated as the beam; retain its zero padding. The field
+    token remains in the original filename/product identity, not the folder.
+    Only basenames are accepted; this does not rename or modify the MS.
+    """
+
+    name = unquote(name)
+    if Path(name).name != name or "\\" in name:
+        return None
+    match = re.search(r"(SB\d+).*?(beam\d+)(?=[._]|$)", name, re.IGNORECASE)
+    if match:
+        sb, beam = match.groups()
+        return sb.upper(), beam.lower()
+    match = re.search(r"(SB\d+)_F\d+_B(\d+)(?=[._]|$)", name, re.IGNORECASE)
+    if match:
+        sb, beam = match.groups()
+        return sb.upper(), f"beam{beam}"
+    return None
 
 
 def sb_number_from_name(name: str) -> int | None:
@@ -250,9 +282,9 @@ def product_sb_dirs(root: Path) -> Iterable[Path]:
 
 
 def completed_product_sb_numbers(root: Path) -> set[int]:
-    """Return SB numbers whose DS and Stokes-I products validate.
+    """Return SB numbers with the required DS and Stokes-I/V filenames.
 
-    中文：返回 DS 和 Stokes-I 产物均通过验证的 SB 编号。
+    中文：返回 DS 和 Stokes-I/V 产物均通过文件名验证的 SB 编号。
     """
 
     return {
@@ -263,28 +295,16 @@ def completed_product_sb_numbers(root: Path) -> set[int]:
 
 
 def completed_product_sb_names(root: Path) -> set[str]:
-    """Return names of complete SB product directories.
+    """Return SB directories with the required product filenames only.
 
     中文：返回完整 SB 产物目录的名称。
     """
 
     names: set[str] = set()
     for sb_dir in product_sb_dirs(root):
-        has_ds = False
-        for ds_path in sb_dir.glob("*.ds"):
-            try:
-                with h5py.File(ds_path, "r") as handle:
-                    has_ds = {"time", "frequency", "flux"}.issubset(handle.keys())
-            except (OSError, ValueError):
-                has_ds = False
-            if has_ds:
-                break
+        has_ds = any(sb_dir.glob("*.ds"))
         stokes_i = sb_dir / "wsclean_model" / "wsclean-MFS-I-image.fits"
-        try:
-            with fits.open(stokes_i, memmap=False) as handle:
-                has_stokes_i = bool(handle and handle[0].data is not None)
-        except (OSError, ValueError):
-            has_stokes_i = False
-        if has_ds and has_stokes_i:
+        stokes_v = sb_dir / "wsclean_model" / "wsclean-MFS-V-image.fits"
+        if has_ds and stokes_i.is_file() and stokes_v.is_file():
             names.add(sb_dir.name)
     return names

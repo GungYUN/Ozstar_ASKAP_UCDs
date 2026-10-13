@@ -1,23 +1,25 @@
-"""Plan, stage and sequentially submit an Ozstar ASKAP UCS range.
+"""Index all sources and process shared ASKAP observations in parallel slots.
 
-English: The login-node controller partitions the inclusive UCS range into
-sequential ada-compatible blocks, prepares one block at a time, and submits
-one compute worker per block. The worker and controller communicate through
-manifests and filesystem state; Slurm queue/accounting commands are not used
-to decide whether scientific processing is complete.
+English: By default --begin/--end select seed sources. A full-catalogue index
+finds companions (including outside that range) sharing the same selected
+CASDA product. Offline jobs run independent observation groups in parallel;
+each group builds one master and processes targets serially with independent
+writable copies. --legacy-source-mode
+retains the previous per-source controller; Gate 6 uses that API directly.
 
-中文：登录节点 controller 将包含端点的 UCS 范围顺序切成 ada-compatible block，
-一次准备一个 block，并为每个 block 提交一个计算 worker。worker 和 controller
-通过 manifest 与文件系统状态通信；不会使用 Slurm 队列/记账命令判断科学处理是否完成。
+中文：范围只选择种子源，共享目标不受范围限制。登录节点查询、下载和提交，
+计算节点离线建立公共模型，再依次使用独立副本处理各目标。旧模式仍可显式选择。
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 import shlex
 import subprocess
+import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +32,12 @@ try:
     from . import config
     from .casda_query import estimated_access_bytes, read_or_query_source
     from .prepare_download import prepare_manifest
+    from .sb_status import (
+        initialize_source_rows,
+        record_source_failure,
+        retry_sb_names,
+        source_has_retryable_failures,
+    )
     from .pipeline_utils import (
         atomic_write_json,
         completed_product_sb_numbers,
@@ -46,6 +54,12 @@ except ImportError:  # Deployed-directory script mode / 部署目录直接脚本
     import config
     from casda_query import estimated_access_bytes, read_or_query_source
     from prepare_download import prepare_manifest
+    from sb_status import (
+        initialize_source_rows,
+        record_source_failure,
+        retry_sb_names,
+        source_has_retryable_failures,
+    )
     from pipeline_utils import (
         atomic_write_json,
         completed_product_sb_numbers,
@@ -74,7 +88,7 @@ UCS_END = config.UCS_END
 SUBMIT = False
 RETRY_EXISTING = False
 
-TERMINAL_STATUSES = {"complete", "no_data", "skipped", "download_failed"}
+TERMINAL_STATUSES = {"complete", "complete_with_failures", "no_data", "skipped", "download_failed"}
 ACTIVE_STATUSES = {"planned", "staged", "queued", "running", "partial"}
 FAILURE_STATUSES = {"failed", "stage_failed", "budget_failed"}
 
@@ -197,15 +211,65 @@ def _source_state(source_name: str) -> dict[str, Any]:
 
 
 def _wall_hours(observations: int, sources: int) -> float:
-    """Estimate wall time from 3-hour observation waves and source overhead.
+    """Estimate wall time from observation waves and source overhead.
 
-    中文：根据每个 observation 的 3 小时 wave 估计和每源额外开销计算 wall time。
+    中文：根据每个 observation wave 的配置时长和每 source chunk 额外开销计算 wall time。
     """
 
     if observations <= 0:
         return 0.0
     waves = int(np.ceil(observations / config.PARALLEL_SLOTS))
     return waves * config.HOURS_PER_OBS + sources * config.SOURCE_OVERHEAD_HOURS
+
+
+def _source_job_wall_hours(observations: int) -> float:
+    """Estimate one source chunk submission within the configured time cap.
+
+    The requested time is ceil(MS/4) * 2 h plus the configured fixed overhead.
+    A larger source is resumed after at most MAX_MS_PER_JOB units.
+    """
+
+    chunk_observations = min(max(1, observations), config.MAX_MS_PER_JOB)
+    return min(
+        _wall_hours(chunk_observations, 1), config.MAX_JOB_WALLTIME_HOURS
+    )
+
+
+def _prepared_ms_units(source_name: str) -> int:
+    """Count downloaded archive/MS work units for the next source submission.
+
+    Login-node preparation has not extracted archives, so their member names
+    are inspected without extraction to count contained ``*.ms`` directories.
+    Already extracted SB directories are included for a resumed source. This
+    count replaces the TAP-row estimate when the sbatch time request is written.
+    """
+
+    longobs = config.STAGING_ROOT / safe_source_name(source_name) / "LongObs"
+    if not longobs.exists():
+        return 0
+    archives = 0
+    for path in longobs.iterdir():
+        if not path.is_file() or not path.name.endswith((".tar", ".tar.gz", ".tgz")):
+            continue
+        try:
+            with tarfile.open(path, mode="r:*") as archive:
+                ms_names = {
+                    part
+                    for member in archive.getmembers()
+                    for part in Path(member.name).parts
+                    if part.endswith(".ms") and not part.endswith(".subtracted.ms")
+                }
+            archives += max(1, len(ms_names))
+        except (OSError, tarfile.TarError):
+            # CASDA archives normally contain one MS.  Retain a conservative
+            # one-unit fallback if a corrupt archive cannot be listed here;
+            # normal compute processing will report the extraction failure.
+            archives += 1
+    extracted = sum(
+        path.is_dir() and re.fullmatch(r"SB\d+_beam\d+", path.name) is not None
+        for path in longobs.iterdir()
+    )
+    return archives + extracted
 
 
 def _time_string(hours: float) -> str:
@@ -246,27 +310,84 @@ def _job_tag(start: int, end: int) -> str:
     return f"{_job_name(start, end)}-{stamp}"
 
 
+def _worker_runtime_environment() -> dict[str, str]:
+    """Freeze non-secret controller settings into a generated worker script.
+
+    English: Ozstar does not guarantee that a submitted job inherits every
+    login-shell variable. Explicit exports keep validation jobs inside their
+    isolated ``ASKAP_WORK`` and make production workers use exactly the paths
+    and processing controls selected by their controller. Credentials are
+    deliberately excluded because compute workers do not access CASDA.
+
+    中文：Ozstar 不保证提交的作业继承登录 shell 的每个变量。显式 export 可确保验证
+    作业留在隔离的 ``ASKAP_WORK`` 中，并让生产 worker 使用 controller 选择的路径和
+    处理参数。这里有意排除凭据，因为计算节点不访问 CASDA。
+    """
+
+    environment = {
+        "ASKAP_WORK": str(config.WORK),
+        "ASKAP_CATALOGUE": str(config.CATALOGUE_PATH),
+        "ASKAP_TIME_CSV": str(config.TIME_CSV_PATH),
+        "DSTOOLS_CONTAINER": str(config.CONTAINER),
+        "APPTAINER_BIN": str(config.APPTAINER_BIN),
+        "ASKAP_APPTAINER_BIND": str(config.APPTAINER_BIND),
+        "ASKAP_HOURS_PER_OBS": str(config.HOURS_PER_OBS),
+        "ASKAP_PARALLEL_SLOTS": str(config.PARALLEL_SLOTS),
+        "ASKAP_CPU_PER_SLOT": str(config.CPU_PER_SLOT),
+        "ASKAP_CREATE_MODEL_THREADS": str(config.CREATE_MODEL_THREADS),
+        "ASKAP_MAX_MS_PER_JOB": str(config.MAX_MS_PER_JOB),
+        "ASKAP_WALLTIME_RESERVE_MINUTES": str(config.WALLTIME_RESERVE_MINUTES),
+        "ASKAP_DSTOOLS_BAND": str(config.BAND),
+        "ASKAP_CREATE_MODEL_ITERATIONS": str(config.CREATE_MODEL_ITERATIONS),
+        "ASKAP_MIN_UV_METRES": str(config.MIN_UV_METRES),
+        "ASKAP_CREATE_MODEL_MULTISCALE": "1" if config.CREATE_MODEL_MULTISCALE else "0",
+        "ASKAP_EXTRACT_MIN_UV_METRES": str(config.EXTRACT_MIN_UV_METRES),
+        "ASKAP_CROP_ARCMIN": str(config.CROP_ARCMIN),
+        "ASKAP_DEFAULT_T_MIN": str(config.DEFAULT_T_MIN),
+        "ASKAP_MJD_J2000": str(config.MJD_J2000),
+        "ASKAP_SPTNUM_THRESHOLD": str(config.SPTNUM_THRESHOLD),
+        "ASKAP_PARTIAL_EXIT_CODE": str(config.PARTIAL_EXIT_CODE),
+        "ASKAP_STAGING_BUDGET_BYTES": str(config.STAGING_BUDGET_BYTES),
+    }
+    # Gate 6 is an opt-in validation hook.  Propagate it only when the login
+    # controller explicitly selected a fault configuration; ordinary
+    # production submissions never receive this variable.
+    # Gate 6 是显式启用的验收钩子。只有登录节点 controller 明确指定故障配置时
+    # 才传给 worker；普通生产作业不会获得该变量。
+    gate6_fault_config = os.environ.get("ASKAP_GATE6_FAULT_CONFIG", "").strip()
+    if gate6_fault_config:
+        environment["ASKAP_GATE6_FAULT_CONFIG"] = gate6_fault_config
+    gate9_fault_config = os.environ.get("ASKAP_GATE9_FAULT_CONFIG", "").strip()
+    if gate9_fault_config:
+        environment["ASKAP_GATE9_FAULT_CONFIG"] = gate9_fault_config
+    return environment
+
+
 def _write_sbatch(
     manifest_path: Path,
     job_tag: str,
     job_name: str,
     allow_compute_download: bool = False,
     max_resubmits: int | None = None,
+    worker_script: str = "process_job.py",
+    walltime_hours: float | None = None,
+    cpus: int | None = None,
+    runtime_environment_override: dict[str, str] | None = None,
 ) -> Path:
-    """Write the worker sbatch script, including bounded partial resubmission.
+    """Write sbatch; shared continuation belongs to the login controller.
 
-    English: The generated worker requests the configured 4 x 8 CPU layout,
-    memory, scratch, and walltime. A dedicated partial exit code causes the
-    same script to resubmit itself up to the configured limit.
+    English: The generated worker requests the configured CPU-slot layout,
+    memory, scratch, and walltime. Only legacy scripts self-submit and emit
+    heartbeat files. Shared scripts retain just the consumed completion signals.
 
-    中文：生成的 worker 请求配置的 4 x 8 CPU 布局、内存、scratch 和 walltime。
-    worker 返回专用 partial code 时，同一个脚本会在配置次数内自动重新提交。
+    中文：生成的 worker 请求配置的 CPU/slot 布局、内存、scratch 和 walltime。
+    只有旧 worker 自行重提并生成 heartbeat；共享模式由登录 controller 续提。
     """
 
     script_path = config.STATE_ROOT / "jobs" / f"{job_tag}.sbatch"
-    time_limit = _time_string(config.JOB_WALLTIME_HOURS)
+    time_limit = _time_string(config.JOB_WALLTIME_HOURS if walltime_hours is None else walltime_hours)
     worker_command = (
-        f"{shlex.quote(config.PYTHON_BIN)} process_job.py --manifest "
+        f"{shlex.quote(config.PYTHON_BIN)} {shlex.quote(worker_script)} --manifest "
         f"{shlex.quote(str(manifest_path))}"
     )
     if allow_compute_download:
@@ -274,6 +395,17 @@ def _write_sbatch(
     bounded_resubmits = config.MAX_AUTO_RESUBMITS if max_resubmits is None else max_resubmits
     if bounded_resubmits < 0:
         raise ValueError("max_resubmits must not be negative")
+    heartbeat_file = Path(f"{manifest_path}.worker_heartbeat")
+    finished_file = Path(f"{manifest_path}.worker_finished")
+    failure_file = Path(f"{manifest_path}.worker_failure")
+    resubmit_pending_file = Path(f"{manifest_path}.resubmit_pending")
+    script_absolute = shlex.quote(str(script_path))
+    runtime_environment = dict(runtime_environment_override) if runtime_environment_override is not None else _worker_runtime_environment()
+    is_shared = worker_script == "shared_worker.py"
+    runtime_exports = [
+        f"export {name}={shlex.quote(value)}"
+        for name, value in runtime_environment.items()
+    ]
     lines = [
         "#!/usr/bin/env bash",
         f"#SBATCH --job-name={job_name}",
@@ -281,7 +413,7 @@ def _write_sbatch(
         f"#SBATCH --error={config.LOG_ROOT}/slurm-%j.err",
         f"#SBATCH --time={time_limit}",
         "#SBATCH --ntasks=1",
-        f"#SBATCH --cpus-per-task={config.PARALLEL_SLOTS * config.CPU_PER_SLOT}",
+        f"#SBATCH --cpus-per-task={config.PARALLEL_SLOTS * config.CPU_PER_SLOT if cpus is None else cpus}",
         f"#SBATCH --mem={config.SBATCH_MEM}",
         f"#SBATCH --tmp={config.SBATCH_TMP}",
     ]
@@ -291,15 +423,35 @@ def _write_sbatch(
         [
             "",
             "set -Eeuo pipefail",
+            "# Freeze controller-selected, non-secret settings for the compute worker.",
+            *runtime_exports,
+            *([] if is_shared else [f"WORKER_HEARTBEAT={shlex.quote(str(heartbeat_file))}"]),
+            f"WORKER_FINISHED={shlex.quote(str(finished_file))}",
+            f"WORKER_FAILURE={shlex.quote(str(failure_file))}",
+            *(["rm -f \"$WORKER_FAILURE\" \"$WORKER_FINISHED\""] if is_shared else [
+                f"RESUBMIT_PENDING={shlex.quote(str(resubmit_pending_file))}",
+                "rm -f \"$WORKER_FAILURE\" \"$WORKER_FINISHED\" \"$RESUBMIT_PENDING\""]),
+            "worker_exit_code=0",
+            *([] if is_shared else ["heartbeat_loop() { while true; do date +%s > \"$WORKER_HEARTBEAT\"; sleep 60; done; }"]),
+            "cleanup_worker() {",
+            "  worker_exit_code=$?",
+            *([] if is_shared else ["  if [[ -n \"${HEARTBEAT_PID:-}\" ]]; then kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi"]),
+            "  date +%s > \"$WORKER_FINISHED\"",
+            f"  if [[ \"$worker_exit_code\" -ne 0 && \"$worker_exit_code\" -ne {config.PARTIAL_EXIT_CODE} ]]; then",
+            "    printf '%s\\n' \"$worker_exit_code\" > \"$WORKER_FAILURE\"",
+            "  fi",
+            "}",
+            "trap cleanup_worker EXIT",
+            *([] if is_shared else ["heartbeat_loop &", "HEARTBEAT_PID=$!"]),
             "module load apptainer",
             f"module load {shlex.quote(config.PYTHON_PARENT_MODULE)}",
             f"module load {shlex.quote(config.PYTHON_MODULE)}",
             f"command -v {shlex.quote(config.PYTHON_BIN)} >/dev/null",
             f"{shlex.quote(config.PYTHON_BIN)} -c "
-            "'import astropy, astroquery, h5py, keyring, numpy, pandas'",
+            "'import astropy, astroquery, keyring, numpy, pandas'",
             f"cd {shlex.quote(str(config.PROGRAM_DIR))}",
-            f"MAX_AUTO_RESUBMITS={int(bounded_resubmits)}",
-            "AUTO_RESUBMIT_COUNT=\"${ASKAP_AUTO_RESUBMIT_COUNT:-0}\"",
+            *([] if is_shared else [f"MAX_AUTO_RESUBMITS={int(bounded_resubmits)}",
+                "AUTO_RESUBMIT_COUNT=\"${ASKAP_AUTO_RESUBMIT_COUNT:-0}\""]),
             "set +e",
             worker_command,
             "worker_status=$?",
@@ -307,17 +459,28 @@ def _write_sbatch(
             f"if [[ \"$worker_status\" -eq {config.PARTIAL_EXIT_CODE} ]]; then",
             "  if (( AUTO_RESUBMIT_COUNT >= MAX_AUTO_RESUBMITS )); then",
             "    echo \"partial worker reached automatic resubmit limit\" >&2",
+            "    printf '%s\\n' \"$worker_status\" > \"$WORKER_FAILURE\"",
             "    exit \"$worker_status\"",
             "  fi",
             "  next_resubmit=$((AUTO_RESUBMIT_COUNT + 1))",
             "  echo \"worker returned partial; submitting attempt $next_resubmit\"",
-            "  sbatch \"--export=ALL,ASKAP_AUTO_RESUBMIT_COUNT=$next_resubmit\" \"$0\"",
-            "  exit 0",
+            "  touch \"$RESUBMIT_PENDING\"",
+            f"  if sbatch \"--export=ALL,ASKAP_AUTO_RESUBMIT_COUNT=$next_resubmit\" {script_absolute}; then",
+            "    exit 0",
+            "  fi",
+            "  rm -f \"$RESUBMIT_PENDING\"",
+            "  printf '%s\\n' \"$worker_status\" > \"$WORKER_FAILURE\"",
+            "  exit \"$worker_status\"",
             "fi",
             "exit \"$worker_status\"",
             "",
         ]
     )
+    if is_shared:
+        # Shared continuations are submitted by the login controller. Workers
+        # never self-submit, avoiding stale finished markers between attempts.
+        start = lines.index(f'if [[ "$worker_status" -eq {config.PARTIAL_EXIT_CODE} ]]; then')
+        lines[start:] = ['exit "$worker_status"', '']
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text("\n".join(lines), encoding="utf-8")
     script_path.chmod(0o750)
@@ -387,6 +550,18 @@ def _plan_source(
     name = source["source_name"]
     current = _source_state(name)
     current_status = current.get("status")
+    if retry_existing and current_status in {"complete", "no_data", "skipped"}:
+        if current.get("expected_sb") is not None:
+            source["expected_sb"] = current["expected_sb"]
+        return source, str(current_status), None
+    if (
+        retry_existing
+        and current_status == "complete_with_failures"
+        and not source_has_retryable_failures(name)
+    ):
+        if current.get("expected_sb") is not None:
+            source["expected_sb"] = current["expected_sb"]
+        return source, "complete_with_failures", "explicit retry limit exhausted"
     if not retry_existing and current_status in TERMINAL_STATUSES:
         if current.get("expected_sb") is not None:
             source["expected_sb"] = current["expected_sb"]
@@ -409,6 +584,7 @@ def _plan_source(
         )
         return source, "skipped", reason
 
+    query_started = time.monotonic()
     rows, cache = read_or_query_source(
         name,
         source["ra"],
@@ -419,6 +595,7 @@ def _plan_source(
     source["query_columns"] = list(rows.colnames)
     source["retains_t_min"] = "t_min" in rows.colnames
     source["retains_t_max"] = "t_max" in rows.colnames
+    initialize_source_rows(source, rows, time.monotonic() - query_started)
     if len(rows) == 0:
         write_source_state(
             name,
@@ -443,15 +620,16 @@ def _plan_source(
             f"{name}: estimated staging size {estimate} bytes exceeds the "
             f"{config.STAGING_BUDGET_BYTES}-byte block budget"
         )
+        record_source_failure(source, message, advance_retry=False)
         write_source_state(
             name,
-            status="budget_failed",
+            status="complete_with_failures",
             ucs_number=source["ucs_number"],
             query_cache=str(cache),
             estimated_staging_bytes=estimate,
             error=message,
         )
-        raise StagingBudgetError(message)
+        return source, "complete_with_failures", message
 
     return source, "planned", None
 
@@ -504,14 +682,12 @@ def _build_block(
             source_records.append(_source_record(source, status, reason))
             continue
         if status == "active":
-            source_records.append(
-                _source_record(source, source.get("active_status", "active"), reason)
+            raise RuntimeError(
+                f"{source['source_name']}: source state is still "
+                f"{source.get('active_status', 'active')}; refusing to advance "
+                "the controller past an active source. Use --retry-existing "
+                "after confirming no worker is running."
             )
-            # Do not start later UCSs while an earlier source belongs to another
-            # worker/controller.
-            # 较早的源仍由其他 worker/controller 负责时，不启动后面的 UCS。
-            block_end = int(row["UCS"])
-            break
         if status != "planned":
             raise RuntimeError(f"Unexpected planning state {status!r} for {source['source_name']}")
 
@@ -533,6 +709,7 @@ def _build_block(
             block_end = int(row["UCS"]) - 1
             break
 
+        source["retry_existing"] = bool(retry_existing)
         sources.append(source)
         source_records.append(_source_record(source, "planned"))
         write_source_state(
@@ -549,6 +726,10 @@ def _build_block(
         )
         estimated_bytes += source_estimate
         total_observations += int(source["obs_count"])
+        # A Slurm submission owns one UCS source.  process_job.py resumes
+        # sources larger than MAX_MS_PER_JOB in later submissions.
+        block_end = int(row["UCS"])
+        break
 
     return {
         "version": 2,
@@ -564,8 +745,14 @@ def _build_block(
         "work_free_before_bytes": work_free,
         "estimated_staging_bytes": estimated_bytes,
         "estimated_observations": total_observations,
-        "estimated_wall_hours": _wall_hours(total_observations, len(sources)),
+        "estimated_wall_hours": _source_job_wall_hours(total_observations)
+        if sources
+        else 0.0,
+        "job_walltime_hours": _source_job_wall_hours(total_observations)
+        if sources
+        else config.JOB_WALLTIME_HOURS,
         "query_rows_are_full_ecsv": True,
+        "retry_existing": bool(retry_existing),
         "sources": sources,
         "source_records": source_records,
     }
@@ -622,6 +809,30 @@ def _new_controller(start: int, end: int) -> dict[str, Any]:
     }
 
 
+def _restart_completed_controller_for_retry(
+    controller: dict[str, Any], controller_path: Path
+) -> dict[str, Any]:
+    """Archive a completed controller and start an explicit failed-source retry."""
+
+    history_root = controller_path.parent / "history"
+    history_root.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    history_path = history_root / f"{controller_path.stem}.before-retry-{stamp}.json"
+    atomic_write_json(history_path, controller)
+    restarted = _new_controller(
+        int(controller["ucs_start"]), int(controller["ucs_end"])
+    )
+    restarted["retry_existing"] = True
+    restarted["retry_of"] = str(history_path)
+    restarted["controller_path"] = str(controller_path)
+    atomic_write_json(controller_path, restarted)
+    logger.info(
+        "Archived completed controller to %s and started explicit retry",
+        history_path,
+    )
+    return restarted
+
+
 def _reset_incomplete_controller_for_retry(
     controller: dict[str, Any],
     controller_path: Path,
@@ -642,13 +853,35 @@ def _reset_incomplete_controller_for_retry(
         return
 
     incomplete = blocks[first_incomplete:]
-    if any(block.get("status") == "submitted" for block in incomplete):
-        raise RuntimeError(
-            f"Cannot retry {controller_path} while a controller block is submitted; "
-            "wait for it to finish or inspect its state first."
-        )
+    submitted_blocks = [block for block in incomplete if block.get("status") == "submitted"]
+    if submitted_blocks:
+        # Do not clear worker artifacts or submit a replacement while the
+        # earlier job might still start or be running.  Once it is inactive,
+        # its marker files are historical evidence only and must not block an
+        # explicit retry.
+        # 旧任务仍可能排队或运行时，不能删除其标记或重复提交。确认不再 active 后，
+        # 这些标记仅是历史信息，不应阻碍显式 retry。
+        active_sources = []
+        for block in submitted_blocks:
+            for record in block.get("source_records", []):
+                source_name = record.get("source_name")
+                if source_name and _source_state(source_name).get("status") in {"queued", "running"}:
+                    active_sources.append(source_name)
+        if active_sources:
+            raise RuntimeError(
+                f"Cannot retry {controller_path}; sources still report queued/running: "
+                + ", ".join(sorted(set(active_sources)))
+            )
 
     for block in incomplete:
+        manifest_path = Path(str(block["manifest_path"]))
+        for suffix in (
+            ".worker_failure",
+            ".worker_heartbeat",
+            ".worker_finished",
+            ".resubmit_pending",
+        ):
+            Path(f"{manifest_path}{suffix}").unlink(missing_ok=True)
         for record in block.get("source_records", []):
             source_name = record.get("source_name")
             if not source_name:
@@ -660,7 +893,10 @@ def _reset_incomplete_controller_for_retry(
                 "queued",
                 "running",
                 "partial",
+                "failed",
                 "stage_failed",
+                "download_failed",
+                "budget_failed",
             }:
                 write_source_state(
                     source_name,
@@ -719,7 +955,7 @@ def _verify_complete_source(record: dict[str, Any]) -> None:
     if missing or residue:
         details = []
         if missing:
-            details.append("missing valid products for " + ", ".join(f"SB{number}" for number in missing))
+            details.append("missing named products for " + ", ".join(f"SB{number}" for number in missing))
         if residue:
             details.append("unprocessed staging entries: " + ", ".join(residue[:20]))
         raise RuntimeError(f"{source_name}: complete state failed filesystem verification ({'; '.join(details)})")
@@ -738,6 +974,8 @@ def _inspect_block(block: dict[str, Any]) -> bool:
         status = state.get("status")
         if status == "complete":
             _verify_complete_source(record)
+        elif status == "complete_with_failures":
+            logger.warning("%s: recorded failures; continuing with the next source", name)
         elif status in {"no_data", "skipped"}:
             continue
         elif status == "download_failed":
@@ -756,6 +994,61 @@ def _inspect_block(block: dict[str, Any]) -> bool:
         logger.info("Block %s-%s still pending: %s", block["block_start"], block["block_end"], ", ".join(pending))
         return False
     return True
+
+
+def _block_redownload_sources(block: dict[str, Any]) -> list[str]:
+    """Return block sources whose first explicit processing retry failed."""
+
+    names = {
+        str(name) for name in block.get("source_names", []) if name
+    }
+    names.update(
+        str(record["source_name"])
+        for record in block.get("source_records", [])
+        if record.get("source_name")
+    )
+    return sorted(
+        name
+        for name in names
+        if retry_sb_names(str(name), {"redownload_required"})
+    )
+
+
+def _reset_block_for_redownload(
+    controller_path: Path,
+    controller: dict[str, Any],
+    block: dict[str, Any],
+) -> None:
+    """Return one explicit-retry block to login-node preparation once."""
+
+    manifest_path = Path(str(block["manifest_path"]))
+    for suffix in (
+        ".worker_failure",
+        ".worker_heartbeat",
+        ".worker_finished",
+        ".resubmit_pending",
+    ):
+        Path(f"{manifest_path}{suffix}").unlink(missing_ok=True)
+    sources = _block_redownload_sources(block)
+    block["status"] = "planned"
+    block["redownload_retry_sources"] = sources
+    block.pop("completed_at", None)
+    block.pop("job_id", None)
+    block.pop("submitted_at", None)
+    block.pop("submitting_at", None)
+    for source_name in sources:
+        write_source_state(
+            source_name,
+            status="planned",
+            retry_reason="fresh CASDA download after failed processing retry",
+        )
+    atomic_write_json(controller_path, controller)
+    logger.warning(
+        "Returning block %s-%s to login-node download for: %s",
+        block["block_start"],
+        block["block_end"],
+        ", ".join(sources),
+    )
 
 
 def _create_block(
@@ -798,6 +1091,8 @@ def _create_block(
         "source_records": manifest["source_records"],
         "source_names": [source["source_name"] for source in manifest["sources"]],
         "estimated_staging_bytes": manifest["estimated_staging_bytes"],
+        "allow_compute_download": allow_compute_download,
+        "max_resubmits": max_resubmits,
         "status": "planned",
     }
     controller["next_ucs"] = manifest["block_end"] + 1
@@ -842,6 +1137,25 @@ def _prepare_and_submit_block(
         block["source_names"] = [
             source["source_name"] for source in manifest.get("sources", [])
         ]
+        # The TAP rows are used for initial planning, but the submitted time is
+        # based on the actual downloaded archive/MS work-unit count.
+        if len(manifest.get("sources", [])) == 1:
+            source = manifest["sources"][0]
+            units = _prepared_ms_units(str(source["source_name"]))
+            if units:
+                source["prepared_ms_units"] = units
+                manifest["estimated_observations"] = units
+                manifest["estimated_wall_hours"] = _source_job_wall_hours(units)
+                manifest["job_walltime_hours"] = _source_job_wall_hours(units)
+                atomic_write_json(manifest_path, manifest)
+                script_path = _write_sbatch(
+                    manifest_path,
+                    str(block["job_tag"]),
+                    _job_name(int(block["block_start"]), int(block["block_end"])),
+                    allow_compute_download=bool(block.get("allow_compute_download", False)),
+                    max_resubmits=int(block.get("max_resubmits", config.MAX_AUTO_RESUBMITS)),
+                )
+                block["script_path"] = str(script_path)
         block["status"] = "prepared"
 
         if not manifest.get("sources"):
@@ -857,10 +1171,21 @@ def _prepare_and_submit_block(
         )
     if block["status"] == "prepared":
         script_path = Path(str(block["script_path"]))
-        job_id = _submit(script_path)
+        controller_path = Path(controller["controller_path"])
+        block["status"] = "submitting"
+        block["submitting_at"] = utc_now()
+        atomic_write_json(controller_path, controller)
+        try:
+            job_id = _submit(script_path)
+        except Exception:
+            block["status"] = "failed"
+            block["error"] = "sbatch submission failed"
+            atomic_write_json(controller_path, controller)
+            raise
         block["job_id"] = job_id
         block["submitted_at"] = utc_now()
         block["status"] = "submitted"
+        atomic_write_json(controller_path, controller)
         for source in manifest["sources"]:
             name = safe_source_name(str(source["source_name"]))
             current = _source_state(name)
@@ -889,14 +1214,48 @@ def _wait_for_block(
             "Waiting %.1f seconds before filesystem polling for block %s-%s",
             initial_delay,
             block["block_start"],
+            block["block_end"],
         )
         time.sleep(initial_delay)
     while True:
+        manifest_path = Path(block["manifest_path"])
+        worker_failure = Path(f"{manifest_path}.worker_failure")
+        if worker_failure.exists():
+            detail = worker_failure.read_text(encoding="utf-8").strip()
+            raise RuntimeError(
+                f"Block {block['block_start']}-{block['block_end']} worker failed"
+                + (f" (exit={detail})" if detail else "")
+            )
         if _inspect_block(block):
+            # Source JSON can become terminal before the sbatch EXIT trap has
+            # finished writing its marker.  Waiting for the marker prevents an
+            # explicit retry from deleting/redownloading an SB while the old
+            # worker is still unwinding.
+            worker_finished = Path(f"{manifest_path}.worker_finished")
+            if block.get("source_names") and not worker_finished.exists():
+                logger.info(
+                    "Block %s-%s has terminal source state; waiting for worker exit marker",
+                    block["block_start"],
+                    block["block_end"],
+                )
+                atomic_write_json(controller_path, controller)
+                if poll_interval > 0:
+                    time.sleep(poll_interval)
+                continue
             block["status"] = "complete"
             block["completed_at"] = utc_now()
             atomic_write_json(controller_path, controller)
             return
+
+        heartbeat = Path(f"{manifest_path}.worker_heartbeat")
+        pending_resubmit = Path(f"{manifest_path}.resubmit_pending")
+        if heartbeat.exists() and not pending_resubmit.exists():
+            heartbeat_age = time.time() - heartbeat.stat().st_mtime
+            if heartbeat_age > config.CONTROLLER_HEARTBEAT_TIMEOUT_SECONDS:
+                raise RuntimeError(
+                    f"Block {block['block_start']}-{block['block_end']} worker heartbeat "
+                    f"is stale ({heartbeat_age:.0f}s); refusing to wait indefinitely"
+                )
         atomic_write_json(controller_path, controller)
         if poll_interval > 0:
             time.sleep(poll_interval)
@@ -931,9 +1290,15 @@ def run_controller(
             raise RuntimeError(f"Controller range does not match {controller_path}")
     else:
         controller = _new_controller(start, end)
+    controller["controller_path"] = str(controller_path)
     if controller.get("status") == "complete":
-        logger.info("Controller already completed: %s", controller_path)
-        return controller
+        if retry_existing:
+            controller = _restart_completed_controller_for_retry(
+                controller, controller_path
+            )
+        else:
+            logger.info("Controller already completed: %s", controller_path)
+            return controller
 
     if retry_existing:
         _reset_incomplete_controller_for_retry(controller, controller_path)
@@ -943,6 +1308,17 @@ def run_controller(
         unfinished = [block for block in controller["blocks"] if block.get("status") != "complete"]
         if unfinished:
             block = unfinished[0]
+            if block.get("status") == "failed":
+                raise RuntimeError(
+                    f"Controller block {block['block_start']}-{block['block_end']} "
+                    f"is failed: {block.get('error', 'unknown error')}. "
+                    "Use --retry-existing after inspecting the failure."
+                )
+            if block.get("status") == "submitting":
+                raise RuntimeError(
+                    f"Controller block {block['block_start']}-{block['block_end']} "
+                    "was interrupted during sbatch submission; inspect before retrying."
+                )
             if submit or prepare_requested:
                 try:
                     _prepare_and_submit_block(
@@ -955,8 +1331,19 @@ def run_controller(
                     atomic_write_json(controller_path, controller)
                     raise
             atomic_write_json(controller_path, controller)
+            if (
+                retry_existing
+                and block.get("status") == "complete"
+                and _block_redownload_sources(block)
+            ):
+                _reset_block_for_redownload(controller_path, controller, block)
+                continue
             if submit and block.get("status") == "submitted":
                 _wait_for_block(controller_path, controller, block, initial_delay, poll_interval)
+                if retry_existing and _block_redownload_sources(block):
+                    _reset_block_for_redownload(
+                        controller_path, controller, block
+                    )
                 continue
             if not submit:
                 logger.info(
@@ -1025,6 +1412,20 @@ def main() -> None:
     parser.add_argument("--submit", action="store_true", default=SUBMIT)
     parser.add_argument("--no-submit", action="store_true")
     parser.add_argument("--retry-existing", action="store_true", default=RETRY_EXISTING)
+    parser.add_argument("--update-crosscatalogue", action="store_true",
+        help="Re-query every catalogue source; publish new CSV/JSON observation index.")
+    parser.add_argument("--crosscatalogue-only", action="store_true",
+        help="Build/update the full index and report query statistics without processing.")
+    parser.add_argument("--radius-frequency-mode", choices=("top", "central"),
+        default=None, help="Half-power radius frequency: arithmetic central (production default) or top; overrides ASKAP_CASDA_RADIUS_FREQUENCY_MODE. Use an isolated ASKAP_WORK for comparisons.")
+    parser.add_argument("--retry-crosscatalogue-failures", action="store_true",
+        help="Index-only: retry failed queries and finish pending ones; retain successful rows without re-querying.")
+    parser.add_argument("--legacy-source-mode", action="store_true",
+        help="Use the previous per-source controller (no shared models).")
+    parser.add_argument("--shared-observation-key",
+        help="Pilot only this exact crosscatalogue product key, retaining all its companions.")
+    parser.add_argument("--parallel-slots", type=int, default=None,
+        help="Concurrent observation groups per job (default ASKAP_PARALLEL_SLOTS=4); slots × CPUs/slot must be <=32.")
     parser.add_argument(
         "--prepare-download",
         action="store_true",
@@ -1049,13 +1450,13 @@ def main() -> None:
         "--max-resubmits",
         type=int,
         default=config.MAX_AUTO_RESUBMITS,
-        help="Maximum automatic self-resubmits after a partial worker exit.",
+        help="Maximum partial-job continuations (shared: login controller; legacy: worker self-resubmits).",
     )
     parser.add_argument(
         "--controller-initial-delay",
         type=float,
         default=config.CONTROLLER_INITIAL_DELAY_SECONDS,
-        help="Initial filesystem-poll delay after submission; completion is never time-based.",
+        help="Legacy mode only: initial filesystem-poll delay after submission.",
     )
     parser.add_argument(
         "--controller-poll-interval",
@@ -1065,10 +1466,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.radius_frequency_mode is not None:
+        config.CASDA_RADIUS_FREQUENCY_MODE = args.radius_frequency_mode
+    if args.parallel_slots is not None:
+        config.PARALLEL_SLOTS = args.parallel_slots
+    if config.PARALLEL_SLOTS < 1 or config.PARALLEL_SLOTS * config.CPU_PER_SLOT > 32:
+        raise SystemExit("--parallel-slots must be positive and slots × CPUs/slot must not exceed 32")
+
     if args.begin > args.end:
         raise SystemExit("--begin must not be larger than --end")
     if args.max_resubmits < 0:
         raise SystemExit("--max-resubmits must not be negative")
+    if args.retry_crosscatalogue_failures and (
+        not args.crosscatalogue_only or args.update_crosscatalogue
+        or args.refresh_cache or args.legacy_source_mode
+    ):
+        raise SystemExit("--retry-crosscatalogue-failures requires --crosscatalogue-only and cannot use full-update/legacy flags")
     if args.no_submit:
         args.submit = False
 
@@ -1077,6 +1490,20 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
+        if not args.legacy_source_mode:
+            if args.allow_compute_download:
+                raise ValueError("Shared workers are offline; compute downloads are not supported")
+            try:
+                from .shared_controller import run
+            except ImportError:
+                from shared_controller import run
+            run(args)
+            return
+        if args.update_crosscatalogue or args.crosscatalogue_only or args.shared_observation_key:
+            raise ValueError("Crosscatalogue options cannot be combined with --legacy-source-mode")
+        shared_plan = read_json(config.STATE_ROOT / "shared-controller.json", {})
+        if shared_plan and shared_plan.get("status") != "complete":
+            raise RuntimeError("Finish the shared plan before using --legacy-source-mode in the same ASKAP_WORK")
         run_controller(
             args.begin,
             args.end,
