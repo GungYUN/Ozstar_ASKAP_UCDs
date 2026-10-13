@@ -1,14 +1,14 @@
-"""Plan, stage and sequentially submit an Ozstar ASKAP UCS range.
+"""Index all sources and process shared ASKAP observations in parallel slots.
 
-English: The login-node controller partitions the inclusive UCS range into
-sequential ada-compatible blocks, prepares one block at a time, and submits
-one compute worker per block. The worker and controller communicate through
-manifests and filesystem state; Slurm queue/accounting commands are not used
-to decide whether scientific processing is complete.
+English: By default --begin/--end select seed sources. A full-catalogue index
+finds companions (including outside that range) sharing the same selected
+CASDA product. Offline jobs run independent observation groups in parallel;
+each group builds one master and processes targets serially with independent
+writable copies. --legacy-source-mode
+retains the previous per-source controller; Gate 6 uses that API directly.
 
-中文：登录节点 controller 将包含端点的 UCS 范围顺序切成 ada-compatible block，
-一次准备一个 block，并为每个 block 提交一个计算 worker。worker 和 controller
-通过 manifest 与文件系统状态通信；不会使用 Slurm 队列/记账命令判断科学处理是否完成。
+中文：范围只选择种子源，共享目标不受范围限制。登录节点查询、下载和提交，
+计算节点离线建立公共模型，再依次使用独立副本处理各目标。旧模式仍可显式选择。
 """
 
 from __future__ import annotations
@@ -223,7 +223,7 @@ def _wall_hours(observations: int, sources: int) -> float:
 
 
 def _source_job_wall_hours(observations: int) -> float:
-    """Estimate one sub-24-hour source chunk submission.
+    """Estimate one source chunk submission within the configured time cap.
 
     The requested time is ceil(MS/4) * 2 h plus the configured fixed overhead.
     A larger source is resumed after at most MAX_MS_PER_JOB units.
@@ -347,6 +347,7 @@ def _worker_runtime_environment() -> dict[str, str]:
         "ASKAP_MJD_J2000": str(config.MJD_J2000),
         "ASKAP_SPTNUM_THRESHOLD": str(config.SPTNUM_THRESHOLD),
         "ASKAP_PARTIAL_EXIT_CODE": str(config.PARTIAL_EXIT_CODE),
+        "ASKAP_STAGING_BUDGET_BYTES": str(config.STAGING_BUDGET_BYTES),
     }
     # Gate 6 is an opt-in validation hook.  Propagate it only when the login
     # controller explicitly selected a fault configuration; ordinary
@@ -356,6 +357,9 @@ def _worker_runtime_environment() -> dict[str, str]:
     gate6_fault_config = os.environ.get("ASKAP_GATE6_FAULT_CONFIG", "").strip()
     if gate6_fault_config:
         environment["ASKAP_GATE6_FAULT_CONFIG"] = gate6_fault_config
+    gate9_fault_config = os.environ.get("ASKAP_GATE9_FAULT_CONFIG", "").strip()
+    if gate9_fault_config:
+        environment["ASKAP_GATE9_FAULT_CONFIG"] = gate9_fault_config
     return environment
 
 
@@ -365,21 +369,25 @@ def _write_sbatch(
     job_name: str,
     allow_compute_download: bool = False,
     max_resubmits: int | None = None,
+    worker_script: str = "process_job.py",
+    walltime_hours: float | None = None,
+    cpus: int | None = None,
+    runtime_environment_override: dict[str, str] | None = None,
 ) -> Path:
-    """Write the worker sbatch script, including bounded partial resubmission.
+    """Write sbatch; shared continuation belongs to the login controller.
 
     English: The generated worker requests the configured CPU-slot layout,
-    memory, scratch, and walltime. A dedicated partial exit code causes the
-    same script to resubmit itself up to the configured limit.
+    memory, scratch, and walltime. Only legacy scripts self-submit and emit
+    heartbeat files. Shared scripts retain just the consumed completion signals.
 
     中文：生成的 worker 请求配置的 CPU/slot 布局、内存、scratch 和 walltime。
-    worker 返回专用 partial code 时，同一个脚本会在配置次数内自动重新提交。
+    只有旧 worker 自行重提并生成 heartbeat；共享模式由登录 controller 续提。
     """
 
     script_path = config.STATE_ROOT / "jobs" / f"{job_tag}.sbatch"
-    time_limit = _time_string(config.JOB_WALLTIME_HOURS)
+    time_limit = _time_string(config.JOB_WALLTIME_HOURS if walltime_hours is None else walltime_hours)
     worker_command = (
-        f"{shlex.quote(config.PYTHON_BIN)} process_job.py --manifest "
+        f"{shlex.quote(config.PYTHON_BIN)} {shlex.quote(worker_script)} --manifest "
         f"{shlex.quote(str(manifest_path))}"
     )
     if allow_compute_download:
@@ -392,9 +400,11 @@ def _write_sbatch(
     failure_file = Path(f"{manifest_path}.worker_failure")
     resubmit_pending_file = Path(f"{manifest_path}.resubmit_pending")
     script_absolute = shlex.quote(str(script_path))
+    runtime_environment = dict(runtime_environment_override) if runtime_environment_override is not None else _worker_runtime_environment()
+    is_shared = worker_script == "shared_worker.py"
     runtime_exports = [
         f"export {name}={shlex.quote(value)}"
-        for name, value in _worker_runtime_environment().items()
+        for name, value in runtime_environment.items()
     ]
     lines = [
         "#!/usr/bin/env bash",
@@ -403,7 +413,7 @@ def _write_sbatch(
         f"#SBATCH --error={config.LOG_ROOT}/slurm-%j.err",
         f"#SBATCH --time={time_limit}",
         "#SBATCH --ntasks=1",
-        f"#SBATCH --cpus-per-task={config.PARALLEL_SLOTS * config.CPU_PER_SLOT}",
+        f"#SBATCH --cpus-per-task={config.PARALLEL_SLOTS * config.CPU_PER_SLOT if cpus is None else cpus}",
         f"#SBATCH --mem={config.SBATCH_MEM}",
         f"#SBATCH --tmp={config.SBATCH_TMP}",
     ]
@@ -415,24 +425,24 @@ def _write_sbatch(
             "set -Eeuo pipefail",
             "# Freeze controller-selected, non-secret settings for the compute worker.",
             *runtime_exports,
-            f"WORKER_HEARTBEAT={shlex.quote(str(heartbeat_file))}",
+            *([] if is_shared else [f"WORKER_HEARTBEAT={shlex.quote(str(heartbeat_file))}"]),
             f"WORKER_FINISHED={shlex.quote(str(finished_file))}",
             f"WORKER_FAILURE={shlex.quote(str(failure_file))}",
-            f"RESUBMIT_PENDING={shlex.quote(str(resubmit_pending_file))}",
-            "rm -f \"$WORKER_FAILURE\" \"$WORKER_FINISHED\" \"$RESUBMIT_PENDING\"",
+            *(["rm -f \"$WORKER_FAILURE\" \"$WORKER_FINISHED\""] if is_shared else [
+                f"RESUBMIT_PENDING={shlex.quote(str(resubmit_pending_file))}",
+                "rm -f \"$WORKER_FAILURE\" \"$WORKER_FINISHED\" \"$RESUBMIT_PENDING\""]),
             "worker_exit_code=0",
-            "heartbeat_loop() { while true; do date +%s > \"$WORKER_HEARTBEAT\"; sleep 60; done; }",
+            *([] if is_shared else ["heartbeat_loop() { while true; do date +%s > \"$WORKER_HEARTBEAT\"; sleep 60; done; }"]),
             "cleanup_worker() {",
             "  worker_exit_code=$?",
-            "  if [[ -n \"${HEARTBEAT_PID:-}\" ]]; then kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi",
+            *([] if is_shared else ["  if [[ -n \"${HEARTBEAT_PID:-}\" ]]; then kill \"$HEARTBEAT_PID\" 2>/dev/null || true; fi"]),
             "  date +%s > \"$WORKER_FINISHED\"",
             f"  if [[ \"$worker_exit_code\" -ne 0 && \"$worker_exit_code\" -ne {config.PARTIAL_EXIT_CODE} ]]; then",
             "    printf '%s\\n' \"$worker_exit_code\" > \"$WORKER_FAILURE\"",
             "  fi",
             "}",
             "trap cleanup_worker EXIT",
-            "heartbeat_loop &",
-            "HEARTBEAT_PID=$!",
+            *([] if is_shared else ["heartbeat_loop &", "HEARTBEAT_PID=$!"]),
             "module load apptainer",
             f"module load {shlex.quote(config.PYTHON_PARENT_MODULE)}",
             f"module load {shlex.quote(config.PYTHON_MODULE)}",
@@ -440,8 +450,8 @@ def _write_sbatch(
             f"{shlex.quote(config.PYTHON_BIN)} -c "
             "'import astropy, astroquery, keyring, numpy, pandas'",
             f"cd {shlex.quote(str(config.PROGRAM_DIR))}",
-            f"MAX_AUTO_RESUBMITS={int(bounded_resubmits)}",
-            "AUTO_RESUBMIT_COUNT=\"${ASKAP_AUTO_RESUBMIT_COUNT:-0}\"",
+            *([] if is_shared else [f"MAX_AUTO_RESUBMITS={int(bounded_resubmits)}",
+                "AUTO_RESUBMIT_COUNT=\"${ASKAP_AUTO_RESUBMIT_COUNT:-0}\""]),
             "set +e",
             worker_command,
             "worker_status=$?",
@@ -466,6 +476,11 @@ def _write_sbatch(
             "",
         ]
     )
+    if is_shared:
+        # Shared continuations are submitted by the login controller. Workers
+        # never self-submit, avoiding stale finished markers between attempts.
+        start = lines.index(f'if [[ "$worker_status" -eq {config.PARTIAL_EXIT_CODE} ]]; then')
+        lines[start:] = ['exit "$worker_status"', '']
     script_path.parent.mkdir(parents=True, exist_ok=True)
     script_path.write_text("\n".join(lines), encoding="utf-8")
     script_path.chmod(0o750)
@@ -1397,6 +1412,20 @@ def main() -> None:
     parser.add_argument("--submit", action="store_true", default=SUBMIT)
     parser.add_argument("--no-submit", action="store_true")
     parser.add_argument("--retry-existing", action="store_true", default=RETRY_EXISTING)
+    parser.add_argument("--update-crosscatalogue", action="store_true",
+        help="Re-query every catalogue source; publish new CSV/JSON observation index.")
+    parser.add_argument("--crosscatalogue-only", action="store_true",
+        help="Build/update the full index and report query statistics without processing.")
+    parser.add_argument("--radius-frequency-mode", choices=("top", "central"),
+        default=None, help="Half-power radius frequency: arithmetic central (production default) or top; overrides ASKAP_CASDA_RADIUS_FREQUENCY_MODE. Use an isolated ASKAP_WORK for comparisons.")
+    parser.add_argument("--retry-crosscatalogue-failures", action="store_true",
+        help="Index-only: retry failed queries and finish pending ones; retain successful rows without re-querying.")
+    parser.add_argument("--legacy-source-mode", action="store_true",
+        help="Use the previous per-source controller (no shared models).")
+    parser.add_argument("--shared-observation-key",
+        help="Pilot only this exact crosscatalogue product key, retaining all its companions.")
+    parser.add_argument("--parallel-slots", type=int, default=None,
+        help="Concurrent observation groups per job (default ASKAP_PARALLEL_SLOTS=4); slots × CPUs/slot must be <=32.")
     parser.add_argument(
         "--prepare-download",
         action="store_true",
@@ -1421,13 +1450,13 @@ def main() -> None:
         "--max-resubmits",
         type=int,
         default=config.MAX_AUTO_RESUBMITS,
-        help="Maximum automatic self-resubmits after a partial worker exit.",
+        help="Maximum partial-job continuations (shared: login controller; legacy: worker self-resubmits).",
     )
     parser.add_argument(
         "--controller-initial-delay",
         type=float,
         default=config.CONTROLLER_INITIAL_DELAY_SECONDS,
-        help="Initial filesystem-poll delay after submission; completion is never time-based.",
+        help="Legacy mode only: initial filesystem-poll delay after submission.",
     )
     parser.add_argument(
         "--controller-poll-interval",
@@ -1437,10 +1466,22 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.radius_frequency_mode is not None:
+        config.CASDA_RADIUS_FREQUENCY_MODE = args.radius_frequency_mode
+    if args.parallel_slots is not None:
+        config.PARALLEL_SLOTS = args.parallel_slots
+    if config.PARALLEL_SLOTS < 1 or config.PARALLEL_SLOTS * config.CPU_PER_SLOT > 32:
+        raise SystemExit("--parallel-slots must be positive and slots × CPUs/slot must not exceed 32")
+
     if args.begin > args.end:
         raise SystemExit("--begin must not be larger than --end")
     if args.max_resubmits < 0:
         raise SystemExit("--max-resubmits must not be negative")
+    if args.retry_crosscatalogue_failures and (
+        not args.crosscatalogue_only or args.update_crosscatalogue
+        or args.refresh_cache or args.legacy_source_mode
+    ):
+        raise SystemExit("--retry-crosscatalogue-failures requires --crosscatalogue-only and cannot use full-update/legacy flags")
     if args.no_submit:
         args.submit = False
 
@@ -1449,6 +1490,20 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     try:
+        if not args.legacy_source_mode:
+            if args.allow_compute_download:
+                raise ValueError("Shared workers are offline; compute downloads are not supported")
+            try:
+                from .shared_controller import run
+            except ImportError:
+                from shared_controller import run
+            run(args)
+            return
+        if args.update_crosscatalogue or args.crosscatalogue_only or args.shared_observation_key:
+            raise ValueError("Crosscatalogue options cannot be combined with --legacy-source-mode")
+        shared_plan = read_json(config.STATE_ROOT / "shared-controller.json", {})
+        if shared_plan and shared_plan.get("status") != "complete":
+            raise RuntimeError("Finish the shared plan before using --legacy-source-mode in the same ASKAP_WORK")
         run_controller(
             args.begin,
             args.end,

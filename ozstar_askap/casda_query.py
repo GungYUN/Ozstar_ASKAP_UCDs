@@ -290,18 +290,42 @@ def _wavelength_values_metres(rows: Table, column: str) -> np.ndarray:
     return values
 
 
+def frequency_selection(em_min_m, em_max_m, mode=None) -> dict:
+    """Frequency bounds/selection in GHz and radial half-power cutoff in degrees.
+
+    Accept scalars or numpy arrays. Central means the arithmetic frequency
+    midpoint, not c divided by the wavelength midpoint. Keep this calculation
+    identical in the filter and exported index.
+    """
+    mode = config.CASDA_RADIUS_FREQUENCY_MODE if mode is None else mode
+    if mode not in {"top", "central"}:
+        raise ValueError("CASDA radius frequency mode must be top or central")
+    if config.CASDA_REFERENCE_FWHM_DEG <= 0 or config.CASDA_REFERENCE_FREQUENCY_GHZ <= 0:
+        raise ValueError("CASDA reference FWHM and frequency must be positive")
+    maximum = SPEED_OF_LIGHT_METRES_PER_SECOND / em_min_m / 1e9
+    minimum = SPEED_OF_LIGHT_METRES_PER_SECOND / em_max_m / 1e9
+    central = (minimum + maximum) / 2
+    selected = maximum if mode == "top" else central
+    return {
+        "frequency_min_ghz": minimum, "frequency_max_ghz": maximum,
+        "frequency_central_ghz": central, "radius_frequency_mode": mode,
+        "radius_frequency_ghz": selected,
+        "half_power_radius_deg": (config.CASDA_REFERENCE_FWHM_DEG / 2
+            * config.CASDA_REFERENCE_FREQUENCY_GHZ / selected),
+    }
+
+
 def _half_power_filter(
     rows: Table,
     separations_deg: np.ndarray,
 ) -> tuple[Table, np.ndarray]:
     """Apply the frequency-dependent ASKAP half-power radial cutoff.
 
-    English: The narrowest beam occurs at the highest frequency in a row.
-    Since ObsCore stores wavelength bounds, that frequency is ``c/em_min``.
-    FWHM is a full width, so the radial half-power cutoff is ``FWHM/2``.
+    English: Default uses the arithmetic frequency midpoint (central); top
+    uses c/em_min. FWHM is a full width, so the radial cutoff is FWHM/2.
 
-    中文：每行最高频率对应最窄波束；由于 ObsCore 保存波长边界，该频率为
-    ``c/em_min``。FWHM 是全宽，因此径向半功率截止值为 ``FWHM/2``。
+    中文：默认 central 使用频率上下限的算术平均；top 使用最高频率 c/em_min。
+    FWHM 是全宽，因此径向半功率截止值为 FWHM/2。
     """
 
     missing = [name for name in ("em_min", "em_max") if name not in rows.colnames]
@@ -310,11 +334,6 @@ def _half_power_filter(
             "CASDA TAP response lacks required spectral column(s): "
             + ", ".join(missing)
         )
-
-    reference_fwhm_deg = config.CASDA_REFERENCE_FWHM_DEG
-    reference_frequency_hz = config.CASDA_REFERENCE_FREQUENCY_GHZ * 1.0e9
-    if reference_fwhm_deg <= 0 or reference_frequency_hz <= 0:
-        raise ValueError("CASDA reference FWHM and frequency must be positive")
 
     em_min_metres = _wavelength_values_metres(rows, "em_min")
     em_max_metres = _wavelength_values_metres(rows, "em_max")
@@ -331,17 +350,10 @@ def _half_power_filter(
             invalid_count,
         )
 
-    max_frequency_hz = np.full(len(rows), np.nan, dtype=float)
-    max_frequency_hz[valid_spectral] = (
-        SPEED_OF_LIGHT_METRES_PER_SECOND / em_min_metres[valid_spectral]
-    )
     half_power_radius_deg = np.full(len(rows), np.nan, dtype=float)
-    half_power_radius_deg[valid_spectral] = (
-        0.5
-        * reference_fwhm_deg
-        * reference_frequency_hz
-        / max_frequency_hz[valid_spectral]
-    )
+    half_power_radius_deg[valid_spectral] = frequency_selection(
+        em_min_metres[valid_spectral], em_max_metres[valid_spectral]
+    )["half_power_radius_deg"]
     within_half_power = valid_spectral & (
         separations_deg <= half_power_radius_deg
     )
@@ -477,6 +489,8 @@ def query_source_table(ra_deg: float, dec_deg: float) -> Table:
         )
     result = _filter_and_deduplicate(rows, ra_deg, dec_deg)
     result.meta.update(_cache_selection_metadata(ra_deg, dec_deg))
+    result.meta["askap_candidate_count"] = len(rows)
+    result.meta["askap_selected_count"] = len(result)
     return result
 
 
@@ -486,7 +500,7 @@ def _cache_selection_metadata(ra_deg: float, dec_deg: float) -> dict[str, Any]:
     中文：返回可重现 TAP 空间筛选、并用于自动识别旧 cache 的元数据。
     """
 
-    return {
+    metadata = {
         "askap_selection_version": TAP_CACHE_SELECTION_VERSION,
         "askap_target_ra_deg": float(ra_deg),
         "askap_target_dec_deg": float(dec_deg),
@@ -498,6 +512,12 @@ def _cache_selection_metadata(ra_deg: float, dec_deg: float) -> dict[str, Any]:
             config.CASDA_REFERENCE_FREQUENCY_GHZ
         ),
     }
+    # Preserve old top signatures/caches; central must have a distinct identity.
+    if config.CASDA_RADIUS_FREQUENCY_MODE not in {"top", "central"}:
+        raise ValueError("CASDA radius frequency mode must be top or central")
+    if config.CASDA_RADIUS_FREQUENCY_MODE != "top":
+        metadata["askap_radius_frequency_mode"] = config.CASDA_RADIUS_FREQUENCY_MODE
+    return metadata
 
 
 def _cache_matches_current_selection(
@@ -516,10 +536,12 @@ def _cache_matches_current_selection(
         return False, "missing column(s): " + ", ".join(missing)
 
     expected = _cache_selection_metadata(ra_deg, dec_deg)
+    if cached.meta.get("askap_radius_frequency_mode", "top") != config.CASDA_RADIUS_FREQUENCY_MODE:
+        return False, "radius frequency mode mismatch"
     if cached.meta.get("askap_selection_version") != TAP_CACHE_SELECTION_VERSION:
         return False, "selection version is absent or obsolete"
     for key, value in expected.items():
-        if key == "askap_selection_version":
+        if key in {"askap_selection_version", "askap_radius_frequency_mode"}:
             continue
         cached_value = _safe_float(cached.meta.get(key))
         if cached_value is None or not np.isclose(

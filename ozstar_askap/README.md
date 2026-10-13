@@ -1,5 +1,27 @@
 # Ozstar ASKAP/UCD Pipeline
 
+## Shared-processing update / 共享观测新版
+
+**新版默认入口已改变。请先阅读 [SHARED_PROCESSING.md](SHARED_PROCESSING.md)。**
+`ozstar_main.py` 现在使用全表查询索引、按相同 CASDA 数据产品复用公共模型。
+`--begin/--end` 仅限定种子源，范围外的共享源也会处理。首次使用会查询整张 catalogue。
+`--update-crosscatalogue --crosscatalogue-only` 只更新索引并导出 CSV，不下载、不提交计算。
+原来的 controller 保留为 `--legacy-source-mode`；下方原生产调度示例与资源估算
+描述的是旧模式，应加该参数。Gate 6/单源测试直接调用旧 API，不构成新版共享验收。
+新旧模式不能同时写入同一个 `ASKAP_WORK`；尤其不要覆盖正在运行的程序目录。
+共享模式默认 4 个独立观测并行（每槽 8 核），`--parallel-slots N` 可调整；
+按最忙槽的估时申请时间，默认上限 48 小时，不是固定申请 48 小时。
+
+新版保留现有下载 URL 编码处理、命令行 tar、失败记录与显式重试策略、I/V 裁剪、
+ada 拉取与校验方式。不修改 SIF，不需要重新构建容器。使用隔离目录验证后再切换生产。
+
+central 默认策略的小样本真实验收为 Gate8，见 [GATE8_CENTRAL_VALIDATION.md](GATE8_CENTRAL_VALIDATION.md)，
+只安排环节1（新增边缘观测、三目标共享及 HIPASS），不提前进行重试/恢复或传输测试。
+共享重试/恢复的真实验收为 [Gate9](GATE9_SHARED_RETRY_VALIDATION.md)，
+使用全新隔离目录；受控错误仅在 driver 显式启用 Gate9 故障配置时生效。
+共享产物的 Ada 拉取验收为 [Gate10](GATE10_SHARED_TRANSFER_VALIDATION.md)：
+只拉取 Gate8 五套 DS/I/V，检查隔离台账、回执、重复拉取及同大小/mtime 的哈希修复。
+
 This directory contains the Ozstar-side ASKAP/UCD pipeline. The normal
 production command is run from an Ozstar login node inside `tmux` or `screen`.
 The controller is resumable and advances only from manifests, source-state
@@ -23,7 +45,10 @@ JSON 文件和经过验证的文件系统产物推进，不根据 Slurm 队列�
    The wrapper copies the directory below `OZSTAR_WORK` (default
    `/fred/oz299/qhuang/ASKAP-UCDs`). It requires `sshpass` and either a
    mode-600 transfer-password file or the one-process `TRANSFER_PASSWORD`
-   environment variable. It never prints a password.
+   environment variable. When neither is present, it prompts for a hidden
+   password in an interactive terminal, without saving it to disk or printing it.
+   It also copies the root-level `Download_ASKAP_Visibility_Remote.py` required
+   by the regression suite; catalogues and runtime state are not uploaded.
 
 2. Copy the two input CSV files into the persistent catalogue directory:
 
@@ -98,7 +123,10 @@ JSON 文件和经过验证的文件系统产物推进，不根据 Slurm 队列�
 
    该脚本把目录复制到 `OZSTAR_WORK` 下，默认是
    `/fred/oz299/qhuang/ASKAP-UCDs`。脚本需要 `sshpass`，以及 mode-600 的传输
-   密码文件或只对当前进程生效的 `TRANSFER_PASSWORD` 环境变量；它不会打印密码。
+   密码文件或只对当前进程生效的 `TRANSFER_PASSWORD` 环境变量。两者均没有时，
+   在交互式终端隐藏输入一次 Ozstar 登录密码；不写入磁盘、不打印密码。
+   同时上传回归测试需要的根目录 `Download_ASKAP_Visibility_Remote.py`，
+   不上传观测表、数据或运行状态。
 
 2. 将两个输入 CSV 放入持久化 catalogue 目录：
 
@@ -173,7 +201,7 @@ module load python/3.12.3
 export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
-export ASKAP_SBATCH_MEM=80G
+export ASKAP_SBATCH_MEM=160G
 $ASKAP_PYTHON_BIN ozstar_main.py --begin 1501 --end 1901 --submit
 ```
 
@@ -181,11 +209,15 @@ The normal sequence is:
 
 1. Load the catalogue and query CASDA TAP within 1 degree for each new source.
    For every returned row, interpret ObsCore `em_min`/`em_max` as wavelength
-   bounds in metres, use `c/em_min` as the highest observing frequency, scale
+   bounds in metres, use `(c/em_min + c/em_max)/2` as the central frequency, scale
    ASKAP's 1.2-degree FWHM at 1.4 GHz as `1/frequency`, and keep the row only
-   when the target lies within `FWHM/2` at that highest frequency. Existing
+   when the target lies within `FWHM/2` at that selected frequency. Existing
    quality, spectral-type, exposure, size, release, and nearest-`obs_id`
    filters are retained. Missing or invalid spectral bounds are rejected.
+   Production defaults to arithmetic central frequency. To use the previous
+   highest-frequency strategy, pass `--radius-frequency-mode top`;
+   `--radius-frequency-mode central` is also retained. CLI overrides
+   `ASKAP_CASDA_RADIUS_FREQUENCY_MODE`; see [comparison instructions](FREQUENCY_COMPARISON.md).
 2. Write the complete filtered and deduplicated TAP rows to
    `state/tap_cache/*.ecsv`. Every returned column is retained, including
    `access_estsize` and returned `t_min`/`t_max`.
@@ -244,18 +276,19 @@ below are the current operational defaults, not passwords or secret values:
 | Range | `ASKAP_UCS_START`, `ASKAP_UCS_END` | Defaults used when CLI range arguments are omitted (`1`, `1000`). |
 | Persistent paths | `ASKAP_WORK` | `/fred/oz299/qhuang/ASKAP-UCDs`; contains staging, products, state, and logs. |
 | Input paths | `ASKAP_CATALOGUE`, `ASKAP_TIME_CSV` | Override the catalogue and legacy `obs_id` to `t_min` CSV paths. |
-| Memory | `ASKAP_SBATCH_MEM` | `80G`; Slurm worker memory. Set this before every run when needed. |
+| Memory | `ASKAP_SBATCH_MEM` | `160G`; total Slurm worker memory (40G per slot with four shared slots). Set this before every run when needed. |
 | Scratch | `ASKAP_SBATCH_TMP` | `10G`; small Slurm scratch allocation only, not the MS/product store. |
 | Partition | `ASKAP_SBATCH_PARTITION` | Empty by default; set to a site-approved Slurm partition when required. |
 | Block/storage | `BLOCK_SIZE` | Fixed code limit of 50 UCS numbers per controller block; not a runtime override. |
 | Block/storage | `ASKAP_STAGING_BUDGET_BYTES` | `2 * 1024**4`; estimated staging admission budget. |
 | CASDA filtering | `ASKAP_CASDA_MAX_FILE_SIZE_KB` | Maximum filtered archive estimate per row. |
-| CASDA beam filtering | `ASKAP_CASDA_INITIAL_QUERY_RADIUS_DEG`, `ASKAP_CASDA_REFERENCE_FWHM_DEG`, `ASKAP_CASDA_REFERENCE_FREQUENCY_GHZ` | Initial TAP radius `1.0` degree; ASKAP FWHM normalization `1.2` degrees at `1.4` GHz. The final radial cutoff is the highest-frequency `FWHM/2`. Changing any value automatically invalidates older TAP caches. |
+| CASDA beam filtering | `ASKAP_CASDA_INITIAL_QUERY_RADIUS_DEG`, `ASKAP_CASDA_REFERENCE_FWHM_DEG`, `ASKAP_CASDA_REFERENCE_FREQUENCY_GHZ` | Initial TAP radius `1.0` degree; ASKAP FWHM normalization `1.2` degrees at `1.4` GHz. The final radial cutoff is `FWHM/2` at the selected frequency. Changing any value automatically invalidates older TAP caches. |
+| CASDA radius frequency | `--radius-frequency-mode`, `ASKAP_CASDA_RADIUS_FREQUENCY_MODE` | Default `central`, the arithmetic frequency midpoint; `top` uses `c/em_min`. CLI takes precedence over the environment. Mode changes require a matching index/cache; old top indexes are not silently reused as central. |
 | CASDA batching | `ASKAP_CASDA_STAGE_BATCH_SIZE`, `ASKAP_CASDA_QUERY_LIMIT` | CASDA staging batch size `20` and TAP row limit `5000`; reaching the row limit is an error rather than a silently truncated result. |
 | Download retry | `ASKAP_CASDA_SOURCE_DOWNLOAD_RETRIES`, `ASKAP_CASDA_SOURCE_RETRY_DELAY_SECONDS` | Each source is retried `3` times with a `30` second delay; after exhaustion the controller records `download_failed` and continues. |
 | Time estimate | `ASKAP_HOURS_PER_OBS` | `2.0` hours per MS observation wave for worker checks. |
 | Time estimate | `ASKAP_SOURCE_OVERHEAD_HOURS` | `2.0` hours per source chunk for extraction, crop, and cleanup. |
-| Slurm time | `ASKAP_MAX_MS_PER_JOB`, `ASKAP_MAX_JOB_WALLTIME_HOURS` | Defaults `40` MS and `23` hours: after download the archive member names determine `N`; each request is `ceil(min(N, 40)/4) * 2 h + 2 h`, capped below 24 h. |
+| Slurm time (legacy) | `ASKAP_MAX_MS_PER_JOB`, `ASKAP_MAX_JOB_WALLTIME_HOURS` | Defaults `40` MS and a `48`-hour cap: each request is `ceil(min(N, 40)/4) * 2 h + 2 h`, limited by that cap. Shared mode uses per-slot group estimates; see SHARED_PROCESSING.md. |
 | Walltime safety | `ASKAP_WALLTIME_RESERVE_MINUTES` | `20` minutes kept in reserve before a partial exit. |
 | CPU | `ASKAP_PARALLEL_SLOTS` | `4` concurrent SB waves. |
 | CPU | `ASKAP_CPU_PER_SLOT` | `8` threads per DStools process; total default is `4 x 8 = 32` CPUs. The product must not exceed 32. |
@@ -305,7 +338,7 @@ module load python/3.12.3
 export ASKAP_PYTHON_PARENT_MODULE=gcc/13.3.0
 export ASKAP_PYTHON_MODULE=python/3.12.3
 export ASKAP_PYTHON_BIN=/fred/oz299/qhuang/ASKAP-UCDs/.venv/askap-python/bin/python
-export ASKAP_SBATCH_MEM=80G
+export ASKAP_SBATCH_MEM=160G
 $ASKAP_PYTHON_BIN ozstar_main.py --begin 1501 --end 1901 --submit
 ```
 
@@ -361,7 +394,7 @@ $ASKAP_PYTHON_BIN ozstar_main.py --begin 1501 --end 1550 \
 | 范围 | `ASKAP_UCS_START`、`ASKAP_UCS_END` | 未提供 CLI 范围时使用，默认 `1`、`1000`。 |
 | 持久化路径 | `ASKAP_WORK` | `/fred/oz299/qhuang/ASKAP-UCDs`，包含 staging、products、state、logs。 |
 | 输入路径 | `ASKAP_CATALOGUE`、`ASKAP_TIME_CSV` | 覆盖 catalogue 和旧 `obs_id` 到 `t_min` CSV 的路径。 |
-| 内存 | `ASKAP_SBATCH_MEM` | `80G`，Slurm worker 内存；需要时每次运行前调整。 |
+| 内存 | `ASKAP_SBATCH_MEM` | `160G`，Slurm worker 总内存（共享四槽时每槽预算 40G）；需要时每次运行前调整。 |
 | scratch | `ASKAP_SBATCH_TMP` | `10G`，仅是小型 Slurm scratch，不存放 MS/产物。 |
 | 分区 | `ASKAP_SBATCH_PARTITION` | 默认空；需要时设置站点批准的 Slurm partition。 |
 | block/storage | `BLOCK_SIZE` | 固定的每 block 最多 50 个 UCS 编号，不能作为运行时覆盖值。 |
@@ -372,7 +405,7 @@ $ASKAP_PYTHON_BIN ozstar_main.py --begin 1501 --end 1550 \
 | 下载重试 | `ASKAP_CASDA_SOURCE_DOWNLOAD_RETRIES`、`ASKAP_CASDA_SOURCE_RETRY_DELAY_SECONDS` | 每个源默认重试 `3` 次、间隔 `30` 秒；仍失败则记录 `download_failed` 并继续下一个源。 |
 | 时间估计 | `ASKAP_HOURS_PER_OBS` | 每个 MS observation wave `2.0` 小时，用于 worker wave 判断。 |
 | 时间估计 | `ASKAP_SOURCE_OVERHEAD_HOURS` | 每个 source chunk `2.0` 小时，用于解压、裁剪和清理。 |
-| Slurm 时间 | `ASKAP_MAX_MS_PER_JOB`、`ASKAP_MAX_JOB_WALLTIME_HOURS` | 默认 `40` MS、`23` 小时；下载后由 archive 成员名确定 `N`，每次申请为 `ceil(min(N,40)/4) × 2 h + 2 h`，保持低于 24 小时。 |
+| Slurm 时间（旧模式） | `ASKAP_MAX_MS_PER_JOB`、`ASKAP_MAX_JOB_WALLTIME_HOURS` | 默认 `40` MS、上限 `48` 小时；下载后确定 `N`，每次申请为 `ceil(min(N,40)/4) × 2 h + 2 h`，不超过上限。共享模式按各槽观测组估时，见 SHARED_PROCESSING.md。 |
 | 墙钟安全 | `ASKAP_WALLTIME_RESERVE_MINUTES` | partial 退出前保留 `20` 分钟。 |
 | CPU | `ASKAP_PARALLEL_SLOTS` | `4` 个并发 SB wave。 |
 | CPU | `ASKAP_CPU_PER_SLOT` | 每个 DStools 进程 `8` 线程；默认总计 `4 x 8 = 32` CPU，不能超过 32。 |
@@ -585,8 +618,8 @@ The confirmed runtime boundaries are:
   generated sbatch script automatically resubmits itself within the configured
   limit.
 - The current resource model is two hours per MS observation, four concurrent
-  slots of eight CPU threads (`4 x 8`), 80G Slurm memory, at most 40 MS and a
-  23-hour request per source chunk, a 20-minute worker reserve, and a compact
+  slots of eight CPU threads (`4 x 8`), 160G Slurm memory, at most 40 MS and a
+  48-hour request cap per source chunk, a 20-minute worker reserve, and a compact
   Slurm job name.
 - Transfer is explicitly initiated on ada, password-safe, and verified.
   Processing never starts an automatic transfer and transfer never deletes.
@@ -651,7 +684,7 @@ Ozstar 持久化产物 <- ada 发起的 SHA-256 校验拉取 <- ada
 - controller 由文件系统状态驱动，不用 `squeue` 或 `sacct` 作为完成依据。partial worker
   写入 checkpoint，生成的 sbatch 会在配置次数内自动 self-resubmit。
 - 当前资源模型是每个 MS observation 2 小时、4 个并发 slot、每 slot 8 个 CPU 线程
-  （`4 x 8`）、80G Slurm 内存、默认每个 source chunk 最多 40 个 MS、23 小时 walltime、20 分钟 worker reserve，
+  （`4 x 8`）、160G Slurm 内存、默认每个 source chunk 最多 40 个 MS、48 小时 walltime 上限、20 分钟 worker reserve，
   以及短 Slurm 名称。
 - 传输必须在 ada 显式发起、密码安全并校验。处理命令不会自动传输，传输程序也不会
   自动删除任一侧产物。

@@ -19,6 +19,7 @@ import argparse
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -41,6 +42,7 @@ try:
         read_t_min_map,
         read_t_min_map_from_table,
         safe_source_name,
+        sb_beam_from_name,
         sb_number_from_name,
         source_product_root,
         utc_now,
@@ -67,6 +69,7 @@ except ImportError:  # Deployed-directory script mode / 部署目录直接脚本
         read_t_min_map,
         read_t_min_map_from_table,
         safe_source_name,
+        sb_beam_from_name,
         sb_number_from_name,
         source_product_root,
         utc_now,
@@ -175,6 +178,35 @@ def _inject_gate6_failure(
     )
 
 
+def _inject_gate9_failure(source_name: str, sb_id: str, beam: str | None,
+                          stage: str, step: str, command: list[str], log_path: Path) -> None:
+    """Opt-in synthetic failure before a command, confined to Gate9 state."""
+    raw_path = os.environ.get("ASKAP_GATE9_FAULT_CONFIG", "").strip()
+    if not raw_path:
+        return
+    work, state = config.WORK.resolve(), config.STATE_ROOT.resolve()
+    path = Path(raw_path).expanduser().resolve()
+    if "gate9" not in str(work).lower() or "validation" not in str(work).lower() or not path.is_relative_to(state):
+        raise ProcessingError("Refusing Gate9 fault config outside an isolated Gate9 validation tree")
+    payload = read_json(path, {})
+    if payload.get("gate") != "gate9" or Path(payload.get("work", "")).resolve() != work:
+        raise ProcessingError("Gate9 fault config does not identify this work directory")
+    rule = {"source_name": source_name, "sb_id": sb_id, "beam": beam,
+            "retry_stage": stage, "step": step}
+    if rule not in payload.get("rules", []):
+        return
+    # Gate9 runs one slot, so events are serial within each isolated case.
+    events_path = state / "gate9-fault-events.json"
+    events = read_json(events_path, [])
+    events.append({**rule, "injected_at": utc_now()})
+    atomic_write_json(events_path, events)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a") as log:
+        log.write(f"{utc_now()} Gate9 synthetic failure BEFORE execution; command: {shlex.join(command)}\n")
+        log.write(f"stderr (synthetic): {step}, source={source_name}, retry_stage={stage}\n")
+    raise ProcessingError(f"Gate9 injected {step} failure for {source_name}_{sb_id}_{beam} at {stage}")
+
+
 def _remove_path(path: Path) -> None:
     """Remove a file, directory, or symlink used by retry cleanup.
 
@@ -193,10 +225,12 @@ def _find_ms(sb_dir: Path) -> Path | None:
     中文：在 SB 目录中查找有效的原始 MeasurementSet。
     """
 
+    if not sb_dir.is_dir():
+        return None
     candidates = sorted(
         path
         for path in sb_dir.iterdir()
-        if path.name.endswith(".ms")
+        if path.is_dir() and path.name.endswith(".ms")
         and not path.name.endswith(".subtracted.ms")
     )
     return candidates[0] if candidates else None
@@ -266,8 +300,11 @@ def _discard_sb_for_redownload(
     _remove_path(product_sb_dir)
     _remove_path(temp_dir)
     sb_pattern = re.compile(rf"SB{sb_number}(?:\D|$)", flags=re.IGNORECASE)
-    for path in list(longobs.iterdir()):
+    identity = sb_beam_from_name(sb_dir.name)
+    for path in list(longobs.iterdir()) if longobs.is_dir() else []:
         if not path.is_file() or not sb_pattern.search(path.name):
+            continue
+        if identity is not None and sb_beam_from_name(path.name) != identity:
             continue
         lower = path.name.lower()
         if lower.endswith((".checksum", ".tar", ".tar.gz", ".tgz", ".part")):
@@ -397,6 +434,14 @@ def _container_command(*arguments: str) -> list[str]:
         value = os.environ.get(name)
         if value:
             command.extend(["--env", f"{name}={value}"])
+    slot_bin = os.environ.get("ASKAP_WSCLEAN_SLOT_BIN")
+    if slot_bin:
+        for name in ("ASKAP_WSCLEAN_SLOT_THREADS", "ASKAP_WSCLEAN_ABS_MEM"):
+            command.extend(["--env", f"{name}={os.environ[name]}"])
+        # Keep the image's own PATH, never the host's module/library paths.
+        command.extend([str(config.CONTAINER), "/bin/bash", "-c",
+            f'export PATH={shlex.quote(slot_bin)}:"$PATH"; exec "$@"', "bash", *arguments])
+        return command
     command.extend([str(config.CONTAINER), *arguments])
     return command
 
@@ -473,6 +518,8 @@ def process_sb(
     product_sb_dir: Path,
     t_min_map: dict[int, float],
     deadline: float | None,
+    *,
+    shared_model: bool = False,
 ) -> dict[str, Any]:
     """Process one SB folder using filename-based product checks.
 
@@ -502,7 +549,12 @@ def process_sb(
         active_step = step
         step_started = time.monotonic()
         try:
+            if os.environ.get("ASKAP_GATE9_FAULT_CONFIG"):
+                _inject_gate9_failure(source["source_name"], sb_id, beam,
+                                      current_retry_stage, step, command, sb_log)
             _run_dstools(command, sb_dir, sb_log, deadline)
+        except NotEnoughTime:
+            raise
         except Exception as exc:
             record(step, "N", error=str(exc))
             raise
@@ -583,7 +635,7 @@ def process_sb(
             # marker written by successful preprocessing to make retries safe.
             # DStools 发现 FIELD_OLD 时会以非零状态退出，因此用成功预处理写入的
             # 标记跳过重复调用，保证重试安全。
-            if not (ms_path / "FIELD_OLD").exists():
+            if not shared_model and not (ms_path / "FIELD_OLD").exists():
                 run_step("preprocess",
                     _container_command("dstools-askap-preprocess", str(ms_path)),
                 )
@@ -603,27 +655,9 @@ def process_sb(
                 _inject_gate6_failure(
                     source["source_name"], sb_id, current_retry_stage
                 )
-                command = _container_command(
-                    "dstools-create-model",
-                    "-v",
-                    "-B",
-                    config.BAND,
-                    "-N",
-                    str(config.CREATE_MODEL_ITERATIONS),
-                    "-j",
-                    str(config.CREATE_MODEL_THREADS),
-                )
-                if config.MIN_UV_METRES > 0:
-                    command.extend(["--minuvw-m", str(config.MIN_UV_METRES)])
-                if config.CREATE_MODEL_MULTISCALE:
-                    command.append("-S")
-                command.extend(
-                    [
-                        "--temp-dir",
-                        str(temp_dir),
-                    ]
-                )
-                command.append(str(ms_path))
+                if shared_model:
+                    raise ProcessingError("Shared model copy is incomplete")
+                command = create_model_command(ms_path, temp_dir)
                 run_step("create_model", command)
             else:
                 record("create_model", "Y", seconds=0)
@@ -685,6 +719,7 @@ def process_sb(
 
         for image in _find_model_images(model_dir):
             stokes = "I" if "MFS-I" in image.name else "V"
+            active_step = "crop_i" if stokes == "I" else "crop_v"
             if not image.is_file():
                 raise ProcessingError(
                     f"Missing required Stokes-{stokes} image: {image}"
@@ -778,6 +813,23 @@ def process_sb(
             "error": str(exc),
             "duration_seconds": round(time.monotonic() - started, 2),
         }
+
+
+def create_model_command(ms_path: Path, temp_dir: Path) -> list[str]:
+    """The same imaging options for private and shared models."""
+    command = _container_command("dstools-create-model", "-v", "-B", config.BAND,
+        "-N", str(config.CREATE_MODEL_ITERATIONS), "-j", str(config.CREATE_MODEL_THREADS))
+    memory_limit = os.environ.get("ASKAP_WSCLEAN_ABS_MEM")
+    if memory_limit:
+        if int(memory_limit) < 1:
+            raise ValueError("ASKAP_WSCLEAN_ABS_MEM must be a positive integer")
+        command.extend(["--abs-mem", str(int(memory_limit))])
+    if config.MIN_UV_METRES > 0:
+        command.extend(["--minuvw-m", str(config.MIN_UV_METRES)])
+    if config.CREATE_MODEL_MULTISCALE:
+        command.append("-S")
+    command.extend(["--temp-dir", str(temp_dir), str(ms_path)])
+    return command
 
 
 def _discover_sb_dirs(longobs: Path) -> list[Path]:

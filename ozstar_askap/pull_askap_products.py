@@ -304,6 +304,10 @@ class RemoteConnection(object):
             "--partial",
             "--delay-updates",
             "--protect-args",
+            # The files-from list already contains only missing/hash-mismatched
+            # files. Do not let rsync's size/mtime quick-check skip a corrupt
+            # local file that happens to have the same size and timestamp.
+            "--ignore-times",
             "--files-from=%s" % files_from,
             "-e",
             remote_shell,

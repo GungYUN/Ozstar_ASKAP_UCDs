@@ -20,6 +20,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import unquote
 
 try:
     from .config import PRODUCT_ROOT, STATE_ROOT, batch_name
@@ -177,6 +178,28 @@ def obs_number(value: Any) -> int | None:
         value = value.decode(errors="replace")
     match = re.search(r"(\d+)$", str(value))
     return int(match.group(1)) if match else None
+
+
+def sb_beam_from_name(name: str) -> tuple[str, str] | None:
+    """Read RACS SB...beamxx or HIPASS SBxxxxx_Fxx_Bxx basenames.
+
+    HIPASS Bxx is treated as the beam; retain its zero padding. The field
+    token remains in the original filename/product identity, not the folder.
+    Only basenames are accepted; this does not rename or modify the MS.
+    """
+
+    name = unquote(name)
+    if Path(name).name != name or "\\" in name:
+        return None
+    match = re.search(r"(SB\d+).*?(beam\d+)(?=[._]|$)", name, re.IGNORECASE)
+    if match:
+        sb, beam = match.groups()
+        return sb.upper(), beam.lower()
+    match = re.search(r"(SB\d+)_F\d+_B(\d+)(?=[._]|$)", name, re.IGNORECASE)
+    if match:
+        sb, beam = match.groups()
+        return sb.upper(), f"beam{beam}"
+    return None
 
 
 def sb_number_from_name(name: str) -> int | None:

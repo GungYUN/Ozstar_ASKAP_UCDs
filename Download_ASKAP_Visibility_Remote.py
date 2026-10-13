@@ -44,7 +44,9 @@ Dec = 9.3668
 # ASKAP primary-beam settings used for the frequency-dependent cross-match.
 # FWHM is the full width, so the usable radial half-power cutoff is FWHM / 2.
 # ObsCore em_min/em_max are vacuum wavelength bounds in metres.  The highest
-# frequency in each observation is therefore c / em_min.
+# frequency is c / em_min; central is the arithmetic frequency midpoint.
+# Manually change RADIUS_FREQUENCY_MODE to 'top' to use the previous strategy.
+RADIUS_FREQUENCY_MODE = 'central'  # 'central' (default) or 'top'
 QUERY_LIMIT = 500
 INITIAL_SEARCH_RADIUS_DEG = 1.0
 REFERENCE_FWHM_DEG = 1.2
@@ -109,9 +111,10 @@ observation_coords = SkyCoord(np.asarray(data['s_ra'], dtype=float) * un.deg,
                               frame='icrs')
 separation_deg = target_coord.separation(observation_coords).deg
 
-# Use the highest frequency (c / em_min), because it has the narrowest beam.
-# Requiring the target to fall inside that beam keeps the full frequency band
-# within the half-power radius.
+# Default to central frequency, matching the main pipeline. Top remains an
+# option for requiring the target to be within the high-frequency half-power radius.
+if RADIUS_FREQUENCY_MODE not in ('top', 'central'):
+    raise ValueError("RADIUS_FREQUENCY_MODE must be 'top' or 'central'")
 em_min_metres = wavelength_column_in_metres(data, 'em_min')
 em_max_metres = wavelength_column_in_metres(data, 'em_max')
 valid_spectral_range = (np.isfinite(em_min_metres)
@@ -125,11 +128,20 @@ max_frequency_ghz[valid_spectral_range] = (
     / em_min_metres[valid_spectral_range]
     / 1.0e9
 )
+min_frequency_ghz = np.full(len(data), np.nan, dtype=float)
+min_frequency_ghz[valid_spectral_range] = (
+    SPEED_OF_LIGHT_METRES_PER_SECOND
+    / em_max_metres[valid_spectral_range]
+    / 1.0e9
+)
+central_frequency_ghz = (min_frequency_ghz + max_frequency_ghz) / 2.0
+radius_frequency_ghz = (central_frequency_ghz if RADIUS_FREQUENCY_MODE == 'central'
+                        else max_frequency_ghz)
 half_power_radius_deg = np.full(len(data), np.nan, dtype=float)
 half_power_radius_deg[valid_spectral_range] = (
     REFERENCE_FWHM_DEG / 2.0
     * REFERENCE_FREQUENCY_GHZ
-    / max_frequency_ghz[valid_spectral_range]
+    / radius_frequency_ghz[valid_spectral_range]
 )
 
 inside_frequency_dependent_radius = (valid_spectral_range
@@ -138,6 +150,7 @@ inside_frequency_dependent_radius = (valid_spectral_range
                                         <= half_power_radius_deg))
 
 print('Rows after quality and coordinate filtering: ', len(data))
+print('Radius frequency mode: ', RADIUS_FREQUENCY_MODE)
 print('Rows removed for invalid em_min/em_max: ',
       int(np.count_nonzero(~valid_spectral_range)))
 print('Rows removed outside the frequency-dependent half-power radius: ',

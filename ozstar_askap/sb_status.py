@@ -9,15 +9,16 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
 try:
     from . import config
-    from .pipeline_utils import utc_now
+    from .pipeline_utils import utc_now, sb_beam_from_name
 except ImportError:
     import config
-    from pipeline_utils import utc_now
+    from pipeline_utils import utc_now, sb_beam_from_name
 
 
 class StateDatabaseError(RuntimeError):
@@ -65,7 +66,9 @@ RETRY_STAGES = {
 }
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect():
+    connection = None
     try:
         DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(DATABASE_PATH, timeout=30)
@@ -106,6 +109,9 @@ def _connect() -> sqlite3.Connection:
             for row in connection.execute("PRAGMA table_info(sb_processing)")
         }
         migrations = {
+            "observation_key": "TEXT",
+            "model_origin": "TEXT",
+            "model_reused": "INTEGER",
             "retry_stage": "TEXT NOT NULL DEFAULT 'none'",
             "processing_retry_count": "INTEGER NOT NULL DEFAULT 0",
             "redownload_retry_count": "INTEGER NOT NULL DEFAULT 0",
@@ -124,9 +130,13 @@ def _connect() -> sqlite3.Connection:
             f"AND error_step IN ({processing_placeholders})",
             PROCESSING_COLUMNS,
         )
-        return connection
+        with connection:
+            yield connection
     except sqlite3.Error as exc:
         raise StateDatabaseError(f"Cannot open SB status database {DATABASE_PATH}: {exc}") from exc
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _text(value: Any) -> str:
@@ -134,6 +144,9 @@ def _text(value: Any) -> str:
 
 
 def _beam(filename: str) -> str:
+    identity = sb_beam_from_name(filename)
+    if identity:
+        return identity[1]
     match = re.search(r"beam(\d+)", filename, flags=re.IGNORECASE)
     return f"beam{match.group(1)}" if match else ""
 
@@ -372,6 +385,45 @@ def prepare_explicit_retry(source_name: str) -> dict[str, list[str]]:
             f"Cannot prepare explicit retry for {source_name}: {exc}"
         ) from exc
     return {"processing": processing, "redownload": redownload}
+
+
+def observation_status(source_name: str, sb_id: str, beam: str) -> dict:
+    """Read one exact source/SB/beam row; never collapse different beams."""
+    with _connect() as connection:
+        connection.row_factory = sqlite3.Row
+        row = connection.execute(
+            "SELECT * FROM sb_processing WHERE source_name=? AND sb_id=? AND beam=?",
+            (source_name, sb_id, beam),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def set_model_origin(source_name: str, sb_id: str, beam: str,
+                     observation_key: str, model_origin: str, reused: bool) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "UPDATE sb_processing SET observation_key=?, model_origin=?, model_reused=? "
+            "WHERE source_name=? AND sb_id=? AND beam=?",
+            (observation_key, model_origin, int(reused), source_name, sb_id, beam),
+        )
+
+
+def prepare_observation_retry(source_name: str, sb_id: str, beam: str) -> str:
+    """Advance only this failed observation; unrelated failures remain untouched."""
+    row = observation_status(source_name, sb_id, beam)
+    stage = row.get("retry_stage", "none")
+    if stage == "processing_failed" or (stage == "none" and row.get("error_step")):
+        assignments = [f"{column}=NULL" for column in PROCESSING_COLUMNS]
+        assignments.extend(f"{column}_seconds=NULL" for column in PROCESSING_COLUMNS)
+        with _connect() as connection:
+            connection.execute(
+                "UPDATE sb_processing SET " + ",".join(assignments) +
+                ",error_step=NULL,error_message=NULL,failure_log_path=NULL,"
+                "retry_stage='processing_retry_ready',processing_retry_count=processing_retry_count+1 "
+                "WHERE source_name=? AND sb_id=? AND beam=? AND retry_stage IN ('processing_failed','none')",
+                (source_name, sb_id, beam))
+        return "processing_retry_ready"
+    return stage
 
 
 def mark_redownload_ready(source_name: str) -> list[str]:

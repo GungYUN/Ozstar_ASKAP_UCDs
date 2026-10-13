@@ -11,15 +11,16 @@ ASKAP_Combined_Image shell 脚本相同的基础 tar 解压和按文件名移动
 from __future__ import annotations
 
 import logging
-import re
 import shutil
 import subprocess
 import time
 from pathlib import Path
 
 try:
+    from .pipeline_utils import sb_beam_from_name
     from .sb_status import record_step
 except ImportError:  # Deployed-directory script mode / 部署目录直接脚本模式。
+    from pipeline_utils import sb_beam_from_name
     from sb_status import record_step
 
 
@@ -64,7 +65,7 @@ def decompress_and_move(longobs: Path, maximum_archives: int | None = None) -> N
         archives = archives[:maximum_archives]
     for archive in archives:
         logger.info("Extracting %s", archive)
-        match = re.search(r"(SB\d+).*?(beam\d+)", archive.name)
+        identity = sb_beam_from_name(archive.name)
         started = time.monotonic()
         try:
             subprocess.run(
@@ -72,21 +73,21 @@ def decompress_and_move(longobs: Path, maximum_archives: int | None = None) -> N
                 check=True,
             )
         except Exception as exc:
-            if match:
-                record_step(longobs.parent.name, match.group(1), "extract_archive", "N",
-                            beam=match.group(2), error=str(exc))
+            if identity:
+                record_step(longobs.parent.name, identity[0], "extract_archive", "N",
+                            beam=identity[1], error=str(exc))
             raise
-        if match:
-            record_step(longobs.parent.name, match.group(1), "extract_archive", "Y",
-                        beam=match.group(2), seconds=time.monotonic() - started)
+        if identity:
+            record_step(longobs.parent.name, identity[0], "extract_archive", "Y",
+                        beam=identity[1], seconds=time.monotonic() - started)
         archive.unlink()
 
     for ms_path in sorted(longobs.glob("*.ms")):
-        match = re.search(r"(SB\d+).*?(beam\d+)", ms_path.name)
-        if not match:
+        identity = sb_beam_from_name(ms_path.name)
+        if not identity:
             logger.warning("Cannot derive SB folder from %s", ms_path.name)
             continue
-        sb_folder = longobs / f"{match.group(1)}_{match.group(2)}"
+        sb_folder = longobs / f"{identity[0]}_{identity[1]}"
         sb_folder.mkdir(parents=True, exist_ok=True)
         target = sb_folder / ms_path.name
         if target.exists():

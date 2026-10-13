@@ -62,13 +62,13 @@ HOURS_PER_OBS = float(os.environ.get("ASKAP_HOURS_PER_OBS", "2.0"))
 SOURCE_OVERHEAD_HOURS = float(os.environ.get("ASKAP_SOURCE_OVERHEAD_HOURS", "2.0"))
 PARALLEL_SLOTS = int(os.environ.get("ASKAP_PARALLEL_SLOTS", "4"))
 CPU_PER_SLOT = int(os.environ.get("ASKAP_CPU_PER_SLOT", "8"))
-JOB_WALLTIME_HOURS = float(os.environ.get("ASKAP_JOB_WALLTIME_HOURS", "23"))
+JOB_WALLTIME_HOURS = float(os.environ.get("ASKAP_JOB_WALLTIME_HOURS", "48"))
 # One compute submission owns one UCS source.  Large sources are resumed in
-# chunks: 40 MS units are ten four-way waves (20 h at the default estimate),
-# leaving the fixed two-hour overhead inside a sub-24-hour request.
+# chunks. Shared jobs pack independent observation groups into CPU slots;
+# the default 48-hour cap is an upper bound, not a fixed Slurm request.
 MAX_MS_PER_JOB = int(os.environ.get("ASKAP_MAX_MS_PER_JOB", "40"))
 MAX_JOB_WALLTIME_HOURS = float(
-    os.environ.get("ASKAP_MAX_JOB_WALLTIME_HOURS", "23")
+    os.environ.get("ASKAP_MAX_JOB_WALLTIME_HOURS", "48")
 )
 SAFETY_FACTOR = float(os.environ.get("ASKAP_SAFETY_FACTOR", "0.85"))
 TARGET_OBS = int(os.environ.get("ASKAP_TARGET_OBS", "40"))
@@ -139,12 +139,16 @@ CASDA_MAX_FILE_SIZE_KB = float(
 )
 CASDA_STAGE_BATCH_SIZE = int(os.environ.get("ASKAP_CASDA_STAGE_BATCH_SIZE", "20"))
 CASDA_QUERY_LIMIT = int(os.environ.get("ASKAP_CASDA_QUERY_LIMIT", "5000"))
+# Full-catalogue queries run sequentially on the login node. Shared workers
+# own independent observations in parallel; each observation's targets are serial.
+CROSSCATALOGUE_QUERY_DELAY_SECONDS = float(os.environ.get("ASKAP_CROSSCATALOGUE_QUERY_DELAY_SECONDS", "0.2"))
+SHARED_TARGET_HOURS = float(os.environ.get("ASKAP_SHARED_TARGET_HOURS", "0.5"))
 # The TAP query first gathers a conservative one-degree neighbourhood.  Each
 # returned row is then filtered against the half-power radius at that row's
-# highest observing frequency.  For ObsCore, the highest frequency is c/em_min
-# because em_min/em_max are vacuum wavelength bounds in metres.
-# TAP 先查询一度范围，再按照每行最高观测频率对应的半功率半径精确筛选。ObsCore
-# 的 em_min/em_max 是以米表示的真空波长边界，因此最高频率是 c/em_min。
+# arithmetic central frequency by default; top remains available as an override.
+# ObsCore em_min/em_max are vacuum wavelength bounds in metres:
+# central = (c/em_min + c/em_max)/2, top = c/em_min.
+# TAP 先查询一度范围，默认按频率上下限的算术平均值筛选；保留 top 选项。
 CASDA_INITIAL_QUERY_RADIUS_DEG = float(
     os.environ.get("ASKAP_CASDA_INITIAL_QUERY_RADIUS_DEG", "1.0")
 )
@@ -154,6 +158,10 @@ CASDA_REFERENCE_FWHM_DEG = float(
 CASDA_REFERENCE_FREQUENCY_GHZ = float(
     os.environ.get("ASKAP_CASDA_REFERENCE_FREQUENCY_GHZ", "1.4")
 )
+# CLI --radius-frequency-mode takes precedence over this environment setting.
+CASDA_RADIUS_FREQUENCY_MODE = os.environ.get(
+    "ASKAP_CASDA_RADIUS_FREQUENCY_MODE", "central"
+).strip().lower()
 CASDA_SOURCE_DOWNLOAD_RETRIES = int(
     os.environ.get("ASKAP_CASDA_SOURCE_DOWNLOAD_RETRIES", "3")
 )
@@ -165,7 +173,7 @@ CASDA_SOURCE_RETRY_DELAY_SECONDS = float(
 # WSClean products, checkpoints, and logs.
 # Slurm 设置。--tmp 只是小型 scratch；持久化 WORK 保存 MS、WSClean 产物、checkpoint
 # 和日志。
-SBATCH_MEM = os.environ.get("ASKAP_SBATCH_MEM", "80G")
+SBATCH_MEM = os.environ.get("ASKAP_SBATCH_MEM", "160G")
 SBATCH_TMP = os.environ.get("ASKAP_SBATCH_TMP", "10G")
 SBATCH_PARTITION = os.environ.get("ASKAP_SBATCH_PARTITION", "")
 PYTHON_BIN = os.environ.get("ASKAP_PYTHON_BIN", "python3")
@@ -235,6 +243,8 @@ def ensure_directories() -> None:
     中文：在运行开始前同时检查 Ozstar 的 32 CPU worker 上限。
     """
 
+    if PARALLEL_SLOTS < 1 or CPU_PER_SLOT < 1:
+        raise ValueError("PARALLEL_SLOTS and CPU_PER_SLOT must be positive")
     if PARALLEL_SLOTS * CPU_PER_SLOT > 32:
         raise ValueError(
             "PARALLEL_SLOTS * CPU_PER_SLOT must not exceed Ozstar's 32 CPU limit"
